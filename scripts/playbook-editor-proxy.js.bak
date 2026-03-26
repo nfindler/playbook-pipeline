@@ -1,0 +1,1102 @@
+#!/usr/bin/env node
+/**
+ * ClimateDoor Playbook Editor API
+ * Port 4300
+ *
+ * Endpoints:
+ *   POST /api/playbooks/:slug/edit      - Direct JSON edit (no AI)
+ *   POST /api/playbooks/:slug/prompt    - AI-powered edit via Sonnet
+ *   POST /api/playbooks/:slug/upload    - Document upload + AI processing
+ *   POST /api/playbooks/:slug/add-signal - Add market signal card
+ *   POST /api/playbooks/:slug/remove    - Remove a card from any section
+ *   GET  /api/playbooks/:slug/versions  - Version history
+ *   POST /api/playbooks/:slug/rollback  - Rollback to a version
+ */
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { execSync, spawn } = require('child_process');
+const { URL } = require('url');
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+const PORT = 4300;
+const SKILL_ROOT = '/home/openclaw/playbook-skill';
+const DATA_DIR = path.join(SKILL_ROOT, 'data');
+const DEPLOY_ROOT = '/var/www/climatedoor/playbooks';
+const RADAR_DATA_DIR = '/home/openclaw/radar-platform/data/pages';
+const STEP7_SCRIPT = path.join(SKILL_ROOT, 'scripts', 'step7_assemble.py');
+
+// Load API key
+let ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+if (!ANTHROPIC_API_KEY) {
+  try {
+    const envFile = fs.readFileSync('/home/openclaw/radar-platform/.env', 'utf8');
+    const match = envFile.match(/^ANTHROPIC_API_KEY=(.+)$/m);
+    if (match) ANTHROPIC_API_KEY = match[1].trim();
+  } catch (e) {
+    log('WARNING: Could not read API key from .env file');
+  }
+}
+
+// Lazy-load Anthropic SDK
+let Anthropic;
+try {
+  Anthropic = require('@anthropic-ai/sdk');
+} catch (e) {
+  log('WARNING: @anthropic-ai/sdk not found. Prompt/upload endpoints will fail.');
+}
+
+// Lazy-load multer and pdf-parse
+let multer, pdfParse;
+try { multer = require('multer'); } catch (e) { log('WARNING: multer not found'); }
+try { pdfParse = require('pdf-parse'); } catch (e) { log('WARNING: pdf-parse not found'); }
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+/** lodash-style setByPath: setByPath(obj, 'a.b.0.c', val) */
+function setByPath(obj, dotPath, value) {
+  const keys = parsePath(dotPath);
+  let cur = obj;
+  for (let i = 0; i < keys.length - 1; i++) {
+    const k = keys[i];
+    if (cur[k] === undefined) {
+      cur[k] = typeof keys[i + 1] === 'number' ? [] : {};
+    }
+    cur = cur[k];
+  }
+  cur[keys[keys.length - 1]] = value;
+}
+
+/** getByPath */
+function getByPath(obj, dotPath) {
+  const keys = parsePath(dotPath);
+  let cur = obj;
+  for (const k of keys) {
+    if (cur === undefined || cur === null) return undefined;
+    cur = cur[k];
+  }
+  return cur;
+}
+
+/** Parse dot-path into array of string/number keys */
+function parsePath(dotPath) {
+  const keys = [];
+  // Split on dots and brackets: "a.b[0].c" -> ["a","b","0","c"]
+  const parts = dotPath.replace(/\[(\d+)\]/g, '.$1').split('.');
+  for (const p of parts) {
+    if (p === '') continue;
+    keys.push(/^\d+$/.test(p) ? parseInt(p, 10) : p);
+  }
+  return keys;
+}
+
+/** Read JSON file */
+function readJSON(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+/** Write JSON file */
+function writeJSON(filePath, data) {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+}
+
+/** Resolve step filename from step key */
+function stepFile(slug, step) {
+  const map = {
+    step1: 'step1-company.json',
+    step2: 'step2-investors.json',
+    step3: 'step3-grants.json',
+    step4: 'step4-market.json',
+    step5: 'step5-experts.json',
+    step6: 'step6-synthesis.json',
+  };
+  const fname = map[step];
+  if (!fname) throw new Error(`Unknown step: ${step}`);
+  return path.join(DATA_DIR, slug, fname);
+}
+
+/** Rebuild playbook (step7) and deploy */
+function rebuild(slug) {
+  log(`Rebuilding playbook for ${slug}...`);
+  execSync(`python3 ${STEP7_SCRIPT} ${slug}`, {
+    cwd: SKILL_ROOT,
+    stdio: 'pipe',
+    timeout: 60000,
+  });
+  // Copy output to deploy path
+  const src = path.join(DATA_DIR, slug, 'playbook.html');
+  const altSrc = path.join(SKILL_ROOT, 'output', slug, 'index.html');
+  const deployDir = path.join(DEPLOY_ROOT, slug);
+  const dest = path.join(deployDir, 'index.html');
+
+  if (!fs.existsSync(deployDir)) {
+    fs.mkdirSync(deployDir, { recursive: true });
+  }
+
+  // Try multiple possible output locations
+  if (fs.existsSync(src)) {
+    fs.copyFileSync(src, dest);
+  } else if (fs.existsSync(altSrc)) {
+    fs.copyFileSync(altSrc, dest);
+  } else {
+    // The script may output directly to deploy path; verify it exists
+    const templateOut = path.join(DEPLOY_ROOT, slug, 'index.html');
+    if (!fs.existsSync(templateOut)) {
+      log('WARNING: Could not find assembled HTML output. Checking common paths...');
+      // Last resort: glob for any .html in the data dir
+      const dataDir = path.join(DATA_DIR, slug);
+      const htmlFiles = fs.readdirSync(dataDir).filter(f => f.endsWith('.html'));
+      if (htmlFiles.length > 0) {
+        fs.copyFileSync(path.join(dataDir, htmlFiles[0]), dest);
+      }
+    }
+  }
+  log(`Rebuild complete for ${slug}`);
+}
+
+// ---------------------------------------------------------------------------
+// Version Control
+// ---------------------------------------------------------------------------
+function ensureVersionDir(slug) {
+  const vDir = path.join(DATA_DIR, slug, 'versions');
+  if (!fs.existsSync(vDir)) fs.mkdirSync(vDir, { recursive: true });
+  return vDir;
+}
+
+function readVersionLog(slug) {
+  const vDir = ensureVersionDir(slug);
+  const logFile = path.join(vDir, 'version-log.json');
+  if (fs.existsSync(logFile)) {
+    return readJSON(logFile);
+  }
+  return { versions: [], current: 'v1.0.0' };
+}
+
+function writeVersionLog(slug, logData) {
+  const vDir = ensureVersionDir(slug);
+  writeJSON(path.join(vDir, 'version-log.json'), logData);
+}
+
+/**
+ * Create a version backup.
+ * changeType: 'patch' (direct edit), 'minor' (prompt edit), 'major' (full re-run)
+ */
+function createVersion(slug, changeType, changedFiles, extra = {}) {
+  const vLog = readVersionLog(slug);
+  const current = vLog.current || 'v1.0.0';
+  const [major, minor, patch] = current.replace('v', '').split('.').map(Number);
+
+  let next;
+  if (changeType === 'major') next = `v${major + 1}.0.0`;
+  else if (changeType === 'minor') next = `v${major}.${minor + 1}.0`;
+  else next = `v${major}.${minor}.${patch + 1}`;
+
+  const vDir = ensureVersionDir(slug);
+  const snapDir = path.join(vDir, next);
+  if (!fs.existsSync(snapDir)) fs.mkdirSync(snapDir, { recursive: true });
+
+  // Copy affected files to snapshot
+  for (const f of changedFiles) {
+    const src = path.join(DATA_DIR, slug, f);
+    if (fs.existsSync(src)) {
+      fs.copyFileSync(src, path.join(snapDir, f));
+    }
+  }
+
+  // Write metadata
+  const metadata = {
+    version: next,
+    timestamp: new Date().toISOString(),
+    change_type: changeType,
+    prompt_text: extra.prompt || null,
+    cost: extra.cost || null,
+    changed_files: changedFiles,
+  };
+  writeJSON(path.join(snapDir, 'metadata.json'), metadata);
+
+  // Update log
+  vLog.versions.push(metadata);
+  vLog.current = next;
+  writeVersionLog(slug, vLog);
+
+  log(`Version ${next} created for ${slug}`);
+  return next;
+}
+
+// ---------------------------------------------------------------------------
+// Section mapping for prompt endpoint
+// ---------------------------------------------------------------------------
+function resolveSection(section) {
+  if (!section) return null;
+  if (section === 'full') return { step: 'all', file: null, path: null };
+
+  // Pillar sections
+  const pillars = ['capital_pillar', 'grants_pillar', 'sales_pillar', 'signals_pillar'];
+  if (pillars.includes(section)) {
+    const key = section.replace('_pillar', '');
+    return { step: 'step6', file: 'step6-synthesis.json', path: `strategy_pillars.${key}` };
+  }
+
+  // Opportunity
+  let m = section.match(/^opportunity_(\d+)$/);
+  if (m) return { step: 'step6', file: 'step6-synthesis.json', path: `creative_opportunities[${m[1]}]` };
+
+  // Investor by db_id
+  m = section.match(/^investor_(.+)$/);
+  if (m) return { step: 'step2', file: 'step2-investors.json', path: 'investors', findBy: 'db_id', findVal: m[1] };
+
+  // Buyer
+  m = section.match(/^buyer_(\d+)$/);
+  if (m) return { step: 'step4', file: 'step4-market.json', path: `buyer_segments[${m[1]}]` };
+
+  // Signal
+  m = section.match(/^signal_(\d+)$/);
+  if (m) return { step: 'step4', file: 'step4-market.json', path: `market_signals[${m[1]}]` };
+
+  // Grant
+  m = section.match(/^grant_(\d+)$/);
+  if (m) return { step: 'step3', file: 'step3-grants.json', path: `direct_grants[${m[1]}]` };
+
+  // Indigenous
+  m = section.match(/^indigenous_(\d+)$/);
+  if (m) return { step: 'step4', file: 'step4-market.json', path: `indigenous_opportunities[${m[1]}]` };
+
+  // Question
+  m = section.match(/^question_(\d+)$/);
+  if (m) return { step: 'step6', file: 'step6-synthesis.json', path: `key_questions[${m[1]}]` };
+
+  // Competitive position
+  if (section === 'competitive_position') {
+    return { step: 'step6', file: 'step6-synthesis.json', path: 'competitive_position' };
+  }
+
+  // Alert
+  m = section.match(/^alert_(\d+)$/);
+  if (m) return { step: 'step6', file: 'step6-synthesis.json', path: `alerts[${m[1]}]` };
+
+  // Expert
+  m = section.match(/^expert_(\d+)$/);
+  if (m) return { step: 'step5', file: 'step5-experts.json', path: `expert_matches[${m[1]}]` };
+
+  // Hero
+  if (section === 'hero') {
+    return { step: 'step1', file: 'step1-company.json', path: 'company.description' };
+  }
+
+  // Full
+  if (section === 'full') {
+    return { step: 'all', file: null, path: null };
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic API helper
+// ---------------------------------------------------------------------------
+async function callSonnet(systemPrompt, userContent) {
+  if (!Anthropic) throw new Error('Anthropic SDK not available');
+  const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 8192,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userContent }],
+  });
+
+  const text = response.content.map(b => b.text || '').join('');
+  const inputTokens = response.usage?.input_tokens || 0;
+  const outputTokens = response.usage?.output_tokens || 0;
+  // Sonnet pricing: $3/M input, $15/M output
+  const cost = (inputTokens * 3 + outputTokens * 15) / 1_000_000;
+
+  return { text, cost, inputTokens, outputTokens };
+}
+
+/** Extract JSON from a response that may contain markdown fences */
+function extractJSON(text) {
+  // Try direct parse first
+  try { return JSON.parse(text); } catch (e) { /* continue */ }
+  // Try extracting from code fences
+  const m = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (m) {
+    return JSON.parse(m[1].trim());
+  }
+  throw new Error('Could not parse JSON from AI response');
+}
+
+// ---------------------------------------------------------------------------
+// Request parsing helpers
+// ---------------------------------------------------------------------------
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try { resolve(JSON.parse(body)); }
+      catch (e) { reject(new Error('Invalid JSON body')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sendJSON(res, status, data) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  });
+  res.end(JSON.stringify(data));
+}
+
+function parseRoute(url, method) {
+  // /api/playbooks/:slug/action
+  const m = url.match(/^\/api\/playbooks\/([^/]+)\/(.+)$/);
+  if (!m) return null;
+  return { slug: m[1], action: m[2] };
+}
+
+// ---------------------------------------------------------------------------
+// Multer setup (for upload endpoint)
+// ---------------------------------------------------------------------------
+let uploadMiddleware = null;
+if (multer) {
+  // We'll configure per-request since slug is dynamic
+}
+
+function handleMultipart(req, slug) {
+  return new Promise((resolve, reject) => {
+    if (!multer) return reject(new Error('multer not available'));
+    const uploadDir = path.join(DATA_DIR, slug, 'uploads');
+    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+    const storage = multer.diskStorage({
+      destination: uploadDir,
+      filename: (req, file, cb) => {
+        const ts = Date.now();
+        cb(null, `${ts}-${file.originalname}`);
+      },
+    });
+    const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } }).single('file');
+    // Multer needs a res-like object; provide minimal stub
+    const fakeRes = { headersSent: false, setHeader: () => {}, end: () => {}, status: () => fakeRes };
+    upload(req, fakeRes, (err) => {
+      if (err) {
+        log('Multer error: ' + err.message);
+        return reject(err);
+      }
+      log('File uploaded: ' + (req.file ? req.file.originalname : 'none'));
+      resolve({ file: req.file, prompt: req.body?.prompt || '' });
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint handlers
+// ---------------------------------------------------------------------------
+
+/** POST /api/playbooks/:slug/edit */
+async function handleEdit(slug, body) {
+  const { step, path: dotPath, value } = body;
+  if (!step || !dotPath || value === undefined) {
+    throw new Error('Missing required fields: step, path, value');
+  }
+
+  const filePath = stepFile(slug, step);
+  const data = readJSON(filePath);
+  const fname = path.basename(filePath);
+
+  // Version backup before modifying
+  const version = createVersion(slug, 'patch', [fname]);
+
+  // Apply edit
+  setByPath(data, dotPath, value);
+  writeJSON(filePath, data);
+
+  // Rebuild and deploy
+  rebuild(slug);
+
+  return { success: true, version };
+}
+
+/** POST /api/playbooks/:slug/prompt */
+async function handlePrompt(slug, body) {
+  const { prompt, section } = body;
+  if (!prompt) throw new Error('Missing required field: prompt');
+
+  const resolved = resolveSection(section);
+  const systemPrompt = 'You are editing a ClimateDoor Growth Playbook section. Return ONLY the modified JSON for the section, preserving the exact same structure. Never use em dashes.';
+
+  let sectionData, filePath, fname, dotPath;
+  let allStepData = null;
+
+  if (!resolved || resolved.step === 'all') {
+    // Full mode: send step6 synthesis data (contains strategy, opportunities, questions, alerts)
+    // This is much cheaper than sending all 6 steps and produces more reliable results
+    const synthFile = stepFile(slug, 'step6');
+    const synthData = readJSON(synthFile);
+
+    const userMsg = `Here is the playbook synthesis data:\n\n${JSON.stringify(synthData, null, 2)}\n\nUser request: ${prompt}\n\nReturn the COMPLETE modified synthesis data as a JSON object with the same top-level keys. Preserve the exact structure.`;
+    const result = await callSonnet(systemPrompt, userMsg);
+    const parsed = extractJSON(result.text);
+
+    if (!parsed || typeof parsed !== 'object') throw new Error('Could not parse JSON from AI response');
+
+    // Version backup
+    const version = createVersion(slug, 'minor', ['step6-synthesis.json'], { prompt, cost: `$${result.cost.toFixed(4)}` });
+
+    // Merge: keep metadata fields, update content fields
+    const original = readJSON(synthFile);
+    const merged = { ...original, ...parsed };
+    // Preserve non-content fields
+    merged.company = original.company;
+    merged.generated_at = original.generated_at;
+    merged.model = original.model;
+    merged.token_usage = original.token_usage;
+
+    writeJSON(synthFile, merged);
+    rebuild(slug);
+    return { success: true, changes: ['step6-synthesis'], cost: `$${result.cost.toFixed(4)}`, version };
+  }
+
+  // Specific section
+  filePath = path.join(DATA_DIR, slug, resolved.file);
+  fname = resolved.file;
+  const fileData = readJSON(filePath);
+
+  if (resolved.findBy) {
+    // Investor: find by db_id in array
+    const arr = getByPath(fileData, resolved.path);
+    if (!Array.isArray(arr)) throw new Error(`Path ${resolved.path} is not an array`);
+    const idx = arr.findIndex(item => String(item[resolved.findBy]) === String(resolved.findVal));
+    if (idx === -1) throw new Error(`Item with ${resolved.findBy}=${resolved.findVal} not found`);
+    sectionData = arr[idx];
+    dotPath = `${resolved.path}[${idx}]`;
+  } else {
+    sectionData = getByPath(fileData, resolved.path);
+    dotPath = resolved.path;
+  }
+
+  if (sectionData === undefined) throw new Error(`Section not found at path: ${resolved.path}`);
+
+  const userMsg = `Here is the current section data:\n\n${JSON.stringify(sectionData, null, 2)}\n\nUser request: ${prompt}\n\nReturn ONLY the modified JSON for this section.`;
+  const result = await callSonnet(systemPrompt, userMsg);
+  const parsed = extractJSON(result.text);
+
+  // Version backup
+  const version = createVersion(slug, 'minor', [fname], { prompt, cost: `$${result.cost.toFixed(4)}` });
+
+  // Apply
+  setByPath(fileData, dotPath, parsed);
+  writeJSON(filePath, fileData);
+
+  rebuild(slug);
+  return { success: true, changes: [section], cost: `$${result.cost.toFixed(4)}`, version };
+}
+
+/** POST /api/playbooks/:slug/upload */
+async function handleUpload(slug, req) {
+  const { file, prompt } = await handleMultipart(req, slug);
+  if (!file) throw new Error('No file uploaded');
+
+  // Extract text from file
+  let fileText = '';
+  const ext = path.extname(file.originalname).toLowerCase();
+
+  if (ext === '.pdf') {
+    if (!pdfParse) throw new Error('pdf-parse not available');
+    const buf = fs.readFileSync(file.path);
+    const pdfData = await pdfParse(buf);
+    fileText = pdfData.text;
+  } else if (['.txt', '.csv', '.tsv', '.md'].includes(ext)) {
+    fileText = fs.readFileSync(file.path, 'utf8');
+  } else {
+    throw new Error(`Unsupported file type: ${ext}`);
+  }
+
+  // Truncate if very long
+  if (fileText.length > 50000) fileText = fileText.slice(0, 50000) + '\n[...truncated]';
+
+  // Load current playbook data
+  const allStepData = {};
+  const steps = ['step1', 'step2', 'step3', 'step4', 'step5', 'step6'];
+  for (const s of steps) {
+    try {
+      allStepData[s] = readJSON(stepFile(slug, s));
+    } catch (e) { /* skip */ }
+  }
+
+  const systemPrompt = 'You are editing a ClimateDoor Growth Playbook based on an uploaded document. Return a JSON array of patches. Each patch: {"step": "step6", "path": "strategy_pillars.capital.summary", "value": "new text"}. Preserve existing data structure. Never use em dashes.';
+  const userMsg = `Here is the current playbook data:\n\n${JSON.stringify(allStepData, null, 2)}\n\nHere is the uploaded document:\n\n${fileText}\n\n${prompt ? `Additional instructions: ${prompt}\n\n` : ''}Return a JSON array of patches to apply.`;
+
+  const result = await callSonnet(systemPrompt, userMsg);
+  const patches = extractJSON(result.text);
+
+  if (!Array.isArray(patches)) throw new Error('AI did not return a valid patches array');
+
+  // Track changed files
+  const changedFiles = new Set();
+
+  // Version backup (all files that might change)
+  const potentialFiles = [...new Set(patches.map(p => {
+    try { return path.basename(stepFile(slug, p.step)); } catch (e) { return null; }
+  }).filter(Boolean))];
+  const version = createVersion(slug, 'minor', potentialFiles, { prompt: prompt || file.originalname, cost: `$${result.cost.toFixed(4)}` });
+
+  // Apply patches
+  let applied = 0;
+  for (const patch of patches) {
+    try {
+      const fp = stepFile(slug, patch.step);
+      const data = readJSON(fp);
+      setByPath(data, patch.path, patch.value);
+      writeJSON(fp, data);
+      changedFiles.add(patch.step);
+      applied++;
+    } catch (e) {
+      log(`Patch failed: ${JSON.stringify(patch)} - ${e.message}`);
+    }
+  }
+
+  rebuild(slug);
+  return {
+    success: true,
+    patches_applied: applied,
+    changes: [...changedFiles],
+    cost: `$${result.cost.toFixed(4)}`,
+    version,
+  };
+}
+
+/** POST /api/playbooks/:slug/add-signal */
+async function handleAddSignal(slug, body) {
+  const { date, signal, relevance, action_level, source_url, category } = body;
+  if (!signal) throw new Error('Missing required field: signal');
+
+  const filePath = stepFile(slug, 'step4');
+  const data = readJSON(filePath);
+  const fname = path.basename(filePath);
+
+  if (!data.market_signals) data.market_signals = [];
+
+  // Version backup
+  const version = createVersion(slug, 'patch', [fname]);
+
+  data.market_signals.push({
+    date: date || new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+    signal,
+    relevance: relevance || '',
+    action_level: action_level || 'watch',
+    source_url: source_url || '',
+    category: category || 'other',
+  });
+
+  writeJSON(filePath, data);
+  rebuild(slug);
+
+  return { success: true, version };
+}
+
+/** POST /api/playbooks/:slug/remove */
+async function handleRemove(slug, body) {
+  const { section, index, db_id, name } = body;
+  if (!section) throw new Error('Missing required field: section');
+
+  // Section -> step file + array path
+  const sectionMap = {
+    investor:    { step: 'step2', arrayPath: 'investors' },
+    grant:       { step: 'step3', arrayPath: 'direct_grants' },
+    signal:      { step: 'step4', arrayPath: 'market_signals' },
+    buyer:       { step: 'step4', arrayPath: 'buyer_segments' },
+    opportunity: { step: 'step6', arrayPath: 'creative_opportunities' },
+    question:    { step: 'step6', arrayPath: 'key_questions' },
+    alert:       { step: 'step6', arrayPath: 'alerts' },
+    expert:      { step: 'step5', arrayPath: 'expert_matches' },
+    indigenous:  { step: 'step4', arrayPath: 'indigenous_opportunities' },
+  };
+
+  const mapping = sectionMap[section];
+  if (!mapping) throw new Error(`Unknown section: ${section}`);
+
+  const filePath = stepFile(slug, mapping.step);
+  const data = readJSON(filePath);
+  const fname = path.basename(filePath);
+  const arr = getByPath(data, mapping.arrayPath);
+
+  if (!Array.isArray(arr)) throw new Error(`${mapping.arrayPath} is not an array`);
+
+  // Version backup
+  const version = createVersion(slug, 'patch', [fname]);
+
+  if (index !== undefined && index !== null) {
+    if (index < 0 || index >= arr.length) throw new Error(`Index ${index} out of range (0-${arr.length - 1})`);
+    arr.splice(index, 1);
+  } else if (db_id) {
+    const idx = arr.findIndex(item => String(item.db_id) === String(db_id));
+    if (idx === -1) throw new Error(`No item with db_id=${db_id} found`);
+    arr.splice(idx, 1);
+  } else if (name) {
+    const idx = arr.findIndex(item => item.name === name);
+    if (idx === -1) throw new Error(`No item with name="${name}" found`);
+    arr.splice(idx, 1);
+  } else {
+    throw new Error('Must provide index, db_id, or name to identify item to remove');
+  }
+
+  setByPath(data, mapping.arrayPath, arr);
+  writeJSON(filePath, data);
+  rebuild(slug);
+
+  return { success: true, version };
+}
+
+/** GET /api/playbooks/:slug/versions */
+async function handleVersions(slug) {
+  const vLog = readVersionLog(slug);
+  return { success: true, current: vLog.current, versions: vLog.versions };
+}
+
+/** POST /api/playbooks/:slug/rollback */
+async function handleRollback(slug, body) {
+  const { version } = body;
+  if (!version) throw new Error('Missing required field: version');
+
+  const vDir = ensureVersionDir(slug);
+  const snapDir = path.join(vDir, version);
+
+  if (!fs.existsSync(snapDir)) throw new Error(`Version ${version} not found`);
+
+  // Read metadata to know which files were saved
+  const metaFile = path.join(snapDir, 'metadata.json');
+  let files;
+  if (fs.existsSync(metaFile)) {
+    const meta = readJSON(metaFile);
+    files = meta.changed_files || [];
+  } else {
+    // Fallback: copy all JSON files from snapshot
+    files = fs.readdirSync(snapDir).filter(f => f.endsWith('.json') && f !== 'metadata.json');
+  }
+
+  // Restore files
+  for (const f of files) {
+    const src = path.join(snapDir, f);
+    const dest = path.join(DATA_DIR, slug, f);
+    if (fs.existsSync(src)) {
+      fs.copyFileSync(src, dest);
+      log(`Restored ${f} from ${version}`);
+    }
+  }
+
+  // Update version log
+  const vLog = readVersionLog(slug);
+  vLog.current = version;
+  vLog.versions.push({
+    version: version + '-rollback',
+    timestamp: new Date().toISOString(),
+    change_type: 'rollback',
+    prompt_text: `Rolled back to ${version}`,
+    cost: null,
+    changed_files: files,
+  });
+  writeVersionLog(slug, vLog);
+
+  rebuild(slug);
+  return { success: true, restored: version, files };
+}
+
+// ---------------------------------------------------------------------------
+// List all playbooks (scans deploy dir + reads step1 metadata)
+// ---------------------------------------------------------------------------
+function handleList() {
+  const playbooks = [];
+  const dirs = fs.readdirSync(DEPLOY_ROOT).filter(d => {
+    if (d === 'editor') return false;
+    const dp = path.join(DEPLOY_ROOT, d);
+    return fs.statSync(dp).isDirectory() && fs.existsSync(path.join(dp, 'index.html'));
+  });
+
+  for (const slug of dirs) {
+    const entry = { slug, name: slug, source: 'static' };
+    // Try to load step1-company.json for rich metadata
+    const step1Path = path.join(DATA_DIR, slug, 'step1-company.json');
+    if (fs.existsSync(step1Path)) {
+      try {
+        const s1 = readJSON(step1Path);
+        const c = s1.company || {};
+        entry.name = c.name || slug;
+        entry.description = c.description || '';
+        entry.sector = c.sector || '';
+        entry.sub_sector = c.sub_sector || '';
+        entry.stage = c.stage || '';
+        entry.trl = String(c.trl || '');
+        entry.hq = (c.geography && c.geography.hq) || '';
+        entry.source = 'pipeline';
+      } catch (e) { /* use defaults */ }
+    }
+
+    // Count discoveries from step data files
+    const metrics = { capital: 0, grants: 0, sales: 0, signals: 0, experts: 0 };
+    try {
+      const s2 = readJSON(path.join(DATA_DIR, slug, 'step2-investors.json'));
+      metrics.capital = (s2.investors || []).length;
+    } catch (e) {}
+    try {
+      const s3 = readJSON(path.join(DATA_DIR, slug, 'step3-grants.json'));
+      metrics.grants = (s3.direct_grants || []).length;
+    } catch (e) {}
+    try {
+      const s4 = readJSON(path.join(DATA_DIR, slug, 'step4-market.json'));
+      metrics.sales = (s4.buyer_segments || []).length;
+      metrics.signals = (s4.market_signals || []).length;
+    } catch (e) {}
+    try {
+      const s5 = readJSON(path.join(DATA_DIR, slug, 'step5-experts.json'));
+      metrics.experts = (s5.expert_matches || []).length;
+    } catch (e) {}
+    entry.metrics = metrics;
+
+    // Alerts from step6
+    entry.alerts = [];
+    try {
+      const s6 = readJSON(path.join(DATA_DIR, slug, 'step6-synthesis.json'));
+      entry.alerts = (s6.alerts || []).slice(0, 4);
+    } catch (e) {}
+
+    // Services offered (derived from metrics)
+    const services = [];
+    if (metrics.capital > 0) services.push('capital');
+    if (metrics.grants > 0) services.push('grants');
+    if (metrics.sales > 0) services.push('sales');
+    try {
+      const s4 = readJSON(path.join(DATA_DIR, slug, 'step4-market.json'));
+      if ((s4.indigenous_opportunities || []).length > 0) services.push('indigenous');
+    } catch (e) {}
+    entry.services = services;
+
+    // Version info
+    try {
+      const vLog = readVersionLog(slug);
+      entry.version = vLog.current;
+    } catch (e) {}
+
+    playbooks.push(entry);
+  }
+
+  // -------------------------------------------------------------------------
+  // RADAR pages — scan JSON data dir, deduplicate, merge
+  // -------------------------------------------------------------------------
+  try {
+    const pipelineNames = new Set(playbooks.map(p =>
+      p.name.toLowerCase().replace(/\s+(design|solutions|technologies|inc|ltd|corp)\.?$/i, '').trim()
+    ));
+
+    const radarFiles = fs.readdirSync(RADAR_DATA_DIR).filter(f => f.endsWith('.json'));
+    const radarMap = new Map(); // normalizedName -> { file, data, updated }
+
+    for (const file of radarFiles) {
+      try {
+        const data = readJSON(path.join(RADAR_DATA_DIR, file));
+        const name = (data.company && data.company.name) || file.replace('.json', '');
+        const norm = name.toLowerCase().replace(/\s+(design|solutions|technologies|inc|ltd|corp)\.?$/i, '').trim();
+        const updated = data.lastUpdated || data.createdAt || '';
+        const existing = radarMap.get(norm);
+        if (!existing || updated > existing.updated) {
+          radarMap.set(norm, { file, data, updated });
+        }
+      } catch (e) { /* skip bad files */ }
+    }
+
+    for (const [norm, { file, data }] of radarMap) {
+      if (pipelineNames.has(norm)) continue;
+
+      const c = data.company || {};
+      const slug = file.replace('.json', '').replace(/-data$/, '');
+
+      // Count metrics
+      const investors = Array.isArray(data.investors) ? data.investors.length : 0;
+      const gSecured = ((data.grants || {}).secured || []).length;
+      const gAdditional = ((data.grants || {}).additional || []).length;
+      const buyers = Array.isArray(data.buyers) ? data.buyers.length : 0;
+      const signals = Array.isArray(data.signals) ? data.signals.length : 0;
+      let experts = 0;
+      if (data.experts && typeof data.experts === 'object' && !Array.isArray(data.experts)) {
+        for (const arr of Object.values(data.experts)) {
+          if (Array.isArray(arr)) experts += arr.length;
+        }
+      }
+
+      // Derive services from data presence
+      const services = [];
+      if (investors > 0) services.push('capital');
+      if (gSecured + gAdditional > 0) services.push('grants');
+      if (buyers > 0) services.push('sales');
+      if (Array.isArray(data.indigenous) && data.indigenous.length > 0) services.push('indigenous');
+
+      // Normalize TRL to just the number(s)
+      const trlRaw = String(c.trl || '');
+      const trlMatch = trlRaw.match(/(\d+(?:\s*[-–]\s*\d+)?)/);
+      const trl = trlMatch ? trlMatch[1].replace(/\s+/g, '') : '';
+
+      // Normalize stage to a clean label
+      let stage = (c.stage || '').split(/\s*[—–/(]/)[0].trim();
+      if (stage.length > 20) stage = stage.split(/\s+/).slice(0, 3).join(' ');
+
+      // Parse alerts — strip HTML, map emoji to severity
+      const alerts = (data.alerts || []).slice(0, 4).map(a => {
+        const raw = (a.text || '').replace(/<[^>]+>/g, '');
+        let level = 'amber';
+        if (raw.includes('🔴') || (a.emoji || '') === '🚨') level = 'red';
+        else if (raw.includes('✅') || raw.includes('🟢')) level = 'green';
+        // Extract just the bold headline if present
+        const boldMatch = (a.text || '').match(/<strong>([^<]+)<\/strong>/);
+        const headline = boldMatch ? boldMatch[1] : raw.replace(/^[🔴⚡✅🚨🟢\s]+/, '').substring(0, 80);
+        return { headline, detail: raw.replace(/^[🔴⚡✅🚨🟢\s]+/, ''), level };
+      });
+
+      playbooks.push({
+        slug,
+        name: c.name || slug,
+        description: c.tagline || '',
+        sector: c.sector || '',
+        sub_sector: c.sub || c.sub_sector || '',
+        stage,
+        trl,
+        hq: c.location || '',
+        source: 'radar',
+        metrics: {
+          capital: investors,
+          grants: gSecured + gAdditional,
+          sales: buyers,
+          signals,
+          experts
+        },
+        alerts,
+        services
+      });
+    }
+  } catch (e) {
+    log(`RADAR scan error: ${e.message}`);
+  }
+
+  return { success: true, playbooks };
+}
+
+// ---------------------------------------------------------------------------
+// Create new playbook (full pipeline, SSE progress)
+// ---------------------------------------------------------------------------
+const STEP_SCRIPTS = [
+  { num: 1, label: 'Company Research', script: 'step1_company_research.py' },
+  { num: 2, label: 'Investor Matching', script: 'step2_investor_matching.py' },
+  { num: 3, label: 'Grant Scanning', script: 'step3_grant_scanning.py' },
+  { num: 4, label: 'Market Intelligence', script: 'step4_market_intelligence.py' },
+  { num: 5, label: 'Expert Matching', script: 'step5_expert_matching.py' },
+  { num: 6, label: 'Strategic Synthesis', script: 'step6_synthesis.py' },
+  { num: 7, label: 'HTML Assembly', script: 'step7_assemble.py' },
+];
+
+async function handleCreate(req, res) {
+  const body = await parseBody(req);
+  const { company_name, website_url, slug: requestedSlug } = body;
+  if (!company_name || !website_url) {
+    return sendJSON(res, 400, { error: 'company_name and website_url are required' });
+  }
+
+  // Derive slug
+  const slug = requestedSlug || company_name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  const dataDir = path.join(DATA_DIR, slug);
+
+  if (fs.existsSync(dataDir) && fs.existsSync(path.join(dataDir, 'step1-company.json'))) {
+    return sendJSON(res, 409, { error: `Playbook "${slug}" already exists` });
+  }
+
+  // SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+  });
+
+  function sendEvent(event, data) {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
+  sendEvent('status', { step: 0, label: 'Initializing', slug });
+
+  // Ensure data directory
+  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+
+  const scriptsDir = path.join(SKILL_ROOT, 'scripts');
+  let failed = false;
+
+  for (const step of STEP_SCRIPTS) {
+    if (failed) break;
+
+    sendEvent('status', { step: step.num, label: `Running Step ${step.num}: ${step.label}...`, slug });
+    log(`[CREATE] Step ${step.num} (${step.label}) for ${slug}`);
+
+    try {
+      const args = step.num === 1
+        ? [path.join(scriptsDir, step.script), company_name, website_url, slug]
+        : [path.join(scriptsDir, step.script), slug];
+
+      await new Promise((resolve, reject) => {
+        const proc = spawn('python3', args, {
+          cwd: SKILL_ROOT,
+          env: { ...process.env, ANTHROPIC_API_KEY },
+          timeout: 300000,
+        });
+
+        let stdout = '', stderr = '';
+        proc.stdout.on('data', d => { stdout += d; });
+        proc.stderr.on('data', d => { stderr += d; });
+        proc.on('close', code => {
+          if (code !== 0) {
+            log(`[CREATE] Step ${step.num} failed (exit ${code}): ${stderr.slice(-500)}`);
+            reject(new Error(`Step ${step.num} failed: ${stderr.slice(-200)}`));
+          } else {
+            log(`[CREATE] Step ${step.num} complete for ${slug}`);
+            resolve();
+          }
+        });
+        proc.on('error', reject);
+      });
+
+      sendEvent('step_done', { step: step.num, label: step.label });
+    } catch (err) {
+      failed = true;
+      sendEvent('error', { step: step.num, message: err.message });
+    }
+  }
+
+  if (!failed) {
+    // Deploy: copy assembled HTML to web root
+    const deployDir = path.join(DEPLOY_ROOT, slug);
+    if (!fs.existsSync(deployDir)) fs.mkdirSync(deployDir, { recursive: true });
+
+    const possibleSources = [
+      path.join(dataDir, 'playbook.html'),
+      path.join(SKILL_ROOT, 'output', slug, 'index.html'),
+    ];
+    for (const src of possibleSources) {
+      if (fs.existsSync(src)) {
+        fs.copyFileSync(src, path.join(deployDir, 'index.html'));
+        break;
+      }
+    }
+
+    sendEvent('complete', { slug, url: `/playbooks/${slug}/` });
+    log(`[CREATE] Pipeline complete for ${slug}`);
+  }
+
+  res.end();
+}
+
+// ---------------------------------------------------------------------------
+// HTTP Server
+// ---------------------------------------------------------------------------
+const server = http.createServer(async (req, res) => {
+  // CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    });
+    return res.end();
+  }
+
+  const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+
+  // Special routes (not slug-based)
+  if (parsedUrl.pathname === '/api/playbooks/_list' && req.method === 'GET') {
+    log('GET /api/playbooks/_list');
+    try {
+      return sendJSON(res, 200, handleList());
+    } catch (err) {
+      log(`ERROR: ${err.message}`);
+      return sendJSON(res, 500, { error: err.message });
+    }
+  }
+
+  if (parsedUrl.pathname === '/api/playbooks/_create' && req.method === 'POST') {
+    log('POST /api/playbooks/_create');
+    return handleCreate(req, res);
+  }
+
+  const route = parseRoute(parsedUrl.pathname, req.method);
+
+  if (!route) {
+    return sendJSON(res, 404, { error: 'Not found' });
+  }
+
+  const { slug, action } = route;
+  log(`${req.method} /api/playbooks/${slug}/${action}`);
+
+  try {
+    let result;
+
+    switch (action) {
+      case 'edit':
+        if (req.method !== 'POST') return sendJSON(res, 405, { error: 'Method not allowed' });
+        result = await handleEdit(slug, await parseBody(req));
+        break;
+
+      case 'prompt':
+        if (req.method !== 'POST') return sendJSON(res, 405, { error: 'Method not allowed' });
+        result = await handlePrompt(slug, await parseBody(req));
+        break;
+
+      case 'upload':
+        if (req.method !== 'POST') return sendJSON(res, 405, { error: 'Method not allowed' });
+        result = await handleUpload(slug, req);
+        break;
+
+      case 'add-signal':
+        if (req.method !== 'POST') return sendJSON(res, 405, { error: 'Method not allowed' });
+        result = await handleAddSignal(slug, await parseBody(req));
+        break;
+
+      case 'remove':
+        if (req.method !== 'POST') return sendJSON(res, 405, { error: 'Method not allowed' });
+        result = await handleRemove(slug, await parseBody(req));
+        break;
+
+      case 'versions':
+        if (req.method !== 'GET') return sendJSON(res, 405, { error: 'Method not allowed' });
+        result = await handleVersions(slug);
+        break;
+
+      case 'rollback':
+        if (req.method !== 'POST') return sendJSON(res, 405, { error: 'Method not allowed' });
+        result = await handleRollback(slug, await parseBody(req));
+        break;
+
+      default:
+        return sendJSON(res, 404, { error: `Unknown action: ${action}` });
+    }
+
+    sendJSON(res, 200, result);
+  } catch (err) {
+    log(`ERROR: ${err.message}`);
+    sendJSON(res, 500, { error: err.message });
+  }
+});
+
+server.listen(PORT, () => {
+  log(`Playbook Editor API running on port ${PORT}`);
+  log(`SKILL_ROOT: ${SKILL_ROOT}`);
+  log(`Data dir: ${DATA_DIR}`);
+  log(`Deploy root: ${DEPLOY_ROOT}`);
+  log(`API key: ${ANTHROPIC_API_KEY ? 'loaded' : 'MISSING'}`);
+});
