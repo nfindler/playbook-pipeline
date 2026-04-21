@@ -5,18 +5,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{{COMPANY_NAME}} | Growth Playbook | ClimateDoor</title>
 <link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,300;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/shared/cd-tokens.css">
+<link rel="stylesheet" href="/shared/cd-nav.css">
 <style>
 :root {
-  --teal:#294144;--teal-deep:#1a2e31;--teal-mid:#1f3538;--teal-light:#3a5a5e;
-  --peach:#F8C18D;--peach-soft:#fbe8d0;--peach-bg:#fef8f1;
-  --sage:#5E807B;--sage-light:#7fa39e;
+  --teal:var(--cd-ink);--teal-deep:#1a2e31;--teal-mid:#1f3538;--teal-light:#3a5a5e;
+  --peach:var(--cd-peach);--peach-soft:var(--cd-peach-soft);--peach-bg:#fef8f1;
+  --sage:var(--cd-sage);--sage-light:#7fa39e;
   --blue:#86B3D9;--blue-soft:#daeaf5;
-  --steel:#698192;--lime:#c4c86e;--sand:#CBB5A1;
-  --canvas:#FAFAF7;--canvas-warm:#F5F0EA;--white:#FFFFFF;
-  --ink:#1a1a1a;--ink-2:#4a4a4a;--ink-3:#8a8a8a;--ink-4:#b8b8b8;
-  --border:#e8e4de;--border-s:#d4cfc7;
-  --sh-sm:0 1px 3px rgba(0,0,0,.04);--sh-md:0 4px 20px rgba(0,0,0,.07);--sh-lg:0 12px 48px rgba(0,0,0,.1);
-  --f:'Montserrat',-apple-system,sans-serif;
+  --steel:var(--cd-ink-soft);--lime:#c4c86e;--sand:#CBB5A1;
+  --canvas:var(--cd-bg);--canvas-warm:var(--cd-surface-alt);--white:var(--cd-surface);
+  --ink:var(--cd-ink);--ink-2:var(--cd-ink-soft);--ink-3:var(--cd-ink-muted);--ink-4:var(--cd-ink-whisper);
+  --border:var(--cd-border);--border-s:var(--cd-border-strong);
+  --sh-sm:var(--cd-shadow-sm);--sh-md:var(--cd-shadow-md);--sh-lg:var(--cd-shadow-lg);
+  --f:var(--cd-font);
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
@@ -61,7 +63,7 @@ body{font-family:var(--f);background:var(--canvas);color:var(--ink);-webkit-font
 @keyframes hsu{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}
 
 /* Hero panel */
-.hpan{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:28px;backdrop-filter:blur(20px);opacity:0;animation:hpin .8s cubic-bezier(.22,1,.36,1) .5s forwards}
+.hpan{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:28px;opacity:0;animation:hpin .8s cubic-bezier(.22,1,.36,1) .5s forwards}
 @keyframes hpin{from{opacity:0;transform:translateY(20px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}
 .hpan-l{font-size:10px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;color:rgba(255,255,255,.4);margin-bottom:6px}
 .hpan-n{font-size:64px;font-weight:800;color:var(--peach);line-height:1;letter-spacing:-.03em}
@@ -544,6 +546,12 @@ body.edit-mode [data-editable]:hover::after {
 </style>
 </head>
 <body>
+<div id="cd-nav-mount"></div>
+<script>
+fetch('/shared/cd-nav.html').then(function(r){ return r.text(); }).then(function(html){
+  var m = document.getElementById('cd-nav-mount'); if (m) m.outerHTML = html;
+}).catch(function(){});
+</script>
 
 <div class="hdr"><div class="hdr-in">
   <div class="hdr-l"><div class="logo">CLIMATE<b>DOOR</b></div><div class="hdr-sep"></div><div class="hdr-client" data-editable>{{COMPANY_NAME}}</div></div>
