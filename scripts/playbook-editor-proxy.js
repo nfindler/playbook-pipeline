@@ -616,8 +616,28 @@ async function buildVisualPdf(slug, opts) {
     try {
       const page = await browser.newPage();
       await page.setViewport({ width: 1280, height: 1800, deviceScaleFactor: 1 });
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.evaluate(() => new Promise(r => setTimeout(r, 2500)));
+      // PDF_VISUAL_WAIT_V31: wait for actual content, not just DOM ready.
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
+      // Hero is always present; wait for it.
+      try { await page.waitForSelector('.hero h1', { timeout: 8000 }); } catch (_) {}
+      // Hook panel mount exists in HTML even if API hasn't filled it; wait for
+      // either hook content OR a 4s timeout indicating no hooks for this slug.
+      try { await page.waitForFunction(() => {
+        const m = document.querySelector('#cd-hook-mount');
+        return m && (m.classList.contains('show') || m.children.length > 0 || m.getAttribute('data-render-state') === 'empty');
+      }, { timeout: 4000 }); } catch (_) {}
+      // Force lazy/IntersectionObserver-gated sections to render by scrolling.
+      try { await page.evaluate(async () => {
+        const total = document.body.scrollHeight;
+        const step = 800;
+        for (let y = 0; y < total; y += step) {
+          window.scrollTo(0, y);
+          await new Promise(r => setTimeout(r, 80));
+        }
+        window.scrollTo(0, 0);
+      }); } catch (_) {}
+      // Wait for any in-flight fetches kicked off by scroll.
+      try { await page.waitForNetworkIdle({ idleTime: 600, timeout: 6000 }); } catch (_) {}
       try { await page.evaluate(() => { document.body.classList.add('pdf-export'); }); } catch (_) {}
       buffer = await page.pdf({
         format: process.env.PLAYBOOK_PDF_PAGE_FORMAT || 'Letter',
