@@ -576,6 +576,72 @@ function buildPlaybookDocx(slug) {
   return Packer.toBuffer(doc);
 }
 
+// ---------------------------------------------------------------------------
+// CLI-1212 v30 Wave 1a: visual-fidelity PDF via headless Chromium (puppeteer).
+// Renders the live playbook URL and captures it 1:1 with dark theme intact.
+// Cached to data/<slug>/exports/visual.pdf with 1h TTL.
+// Sequential only (lock prevents concurrent renders pushing RAM > 70%).
+// ---------------------------------------------------------------------------
+const puppeteerLib = require('puppeteer');
+const PDF_VISUAL_TTL_MS = parseInt(process.env.PLAYBOOK_PDF_CACHE_TTL_MS || '3600000', 10);
+const PDF_VISUAL_PUBLIC_BASE = process.env.PLAYBOOK_PUBLIC_BASE || 'https://www.climatedoor.ai';
+let _PDF_VISUAL_LOCK = null;
+
+async function buildVisualPdf(slug, opts) {
+  opts = opts || {};
+  const exportsDir = path.join(DATA_DIR, slug, 'exports');
+  const cachePath = path.join(exportsDir, 'visual.pdf');
+  const stampPath = path.join(exportsDir, '.cache-stamp');
+  fs.mkdirSync(exportsDir, { recursive: true });
+
+  if (!opts.bust && fs.existsSync(cachePath) && fs.existsSync(stampPath)) {
+    const stamp = parseInt(fs.readFileSync(stampPath, 'utf8'), 10) || 0;
+    if (Date.now() - stamp < PDF_VISUAL_TTL_MS) {
+      return { buffer: fs.readFileSync(cachePath), cached: true, age_ms: Date.now() - stamp };
+    }
+  }
+
+  while (_PDF_VISUAL_LOCK) {
+    await _PDF_VISUAL_LOCK.catch(() => {});
+  }
+  let unlock;
+  _PDF_VISUAL_LOCK = new Promise(r => { unlock = r; });
+  let buffer = null;
+  try {
+    const url = PDF_VISUAL_PUBLIC_BASE + '/playbooks/' + encodeURIComponent(slug) + '/?print_mode=visual';
+    const browser = await puppeteerLib.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+    });
+    try {
+      const page = await browser.newPage();
+      await page.setViewport({ width: 1280, height: 1800, deviceScaleFactor: 1 });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.evaluate(() => new Promise(r => setTimeout(r, 2500)));
+      try { await page.evaluate(() => { document.body.classList.add('pdf-export'); }); } catch (_) {}
+      buffer = await page.pdf({
+        format: process.env.PLAYBOOK_PDF_PAGE_FORMAT || 'Letter',
+        printBackground: true,
+        margin: { top: '0.4in', right: '0.4in', bottom: '0.5in', left: '0.4in' },
+        displayHeaderFooter: false
+      });
+    } finally {
+      await browser.close();
+    }
+    fs.writeFileSync(cachePath, buffer);
+    fs.writeFileSync(stampPath, String(Date.now()));
+  } finally {
+    unlock();
+    _PDF_VISUAL_LOCK = null;
+  }
+  return { buffer, cached: false, age_ms: 0 };
+}
+
+function bustVisualPdfCache(slug) {
+  const stampPath = path.join(DATA_DIR, slug, 'exports', '.cache-stamp');
+  try { fs.unlinkSync(stampPath); } catch (_) {}
+}
+
 
 // ---------------------------------------------------------------------------
 // CLI-1193 v27: concurrency semaphore (default 5 simultaneous playbook runs)
@@ -1858,6 +1924,37 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         log(`ERROR docx export: ${err.message}`);
         return sendJSON(res, 500, { error: 'docx_failed', detail: err.message.slice(0, 400) });
+      }
+    }
+
+    const pdfVisualMatch = parsedUrl.pathname.match(/^\/api\/playbooks\/([a-z0-9-]+)\/export\/pdf-visual$/i);
+    if (pdfVisualMatch && req.method === 'POST') {
+      const slug = pdfVisualMatch[1];
+      log(`POST /api/playbooks/${slug}/export/pdf-visual`);
+      try {
+        const slugDir = path.join(DEPLOY_ROOT, slug);
+        if (!fs.existsSync(slugDir)) return sendJSON(res, 404, { error: `Playbook ${slug} not found` });
+        const bust = parsedUrl.searchParams.get('bust') === '1';
+        const out = await buildVisualPdf(slug, { bust });
+        let company = slug;
+        try {
+          const s1 = JSON.parse(fs.readFileSync(path.join(DATA_DIR, slug, 'step1-company.json'), 'utf8'));
+          if (s1 && s1.company && s1.company.name) company = s1.company.name;
+        } catch (_) {}
+        const dateStamp = new Date().toISOString().slice(0, 10);
+        const safeName = company.replace(/[^A-Za-z0-9 ._-]+/g, '').slice(0, 60).trim() || slug;
+        const filename = safeName + ' Playbook ' + dateStamp + ' Visual.pdf';
+        res.writeHead(200, {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': 'attachment; filename="' + filename.replace(/"/g, '') + '"',
+          'Content-Length': out.buffer.length,
+          'X-CD-Cache': out.cached ? 'hit-' + Math.round(out.age_ms / 1000) + 's' : 'miss',
+          'Access-Control-Allow-Origin': '*'
+        });
+        return res.end(out.buffer);
+      } catch (err) {
+        log(`ERROR pdf-visual: ${err.message}`);
+        return sendJSON(res, 500, { error: 'pdf_visual_failed', detail: err.message.slice(0, 400) });
       }
     }
   }
