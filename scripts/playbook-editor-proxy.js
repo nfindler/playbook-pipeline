@@ -360,6 +360,48 @@ function sendJSON(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
+// ---------------------------------------------------------------------------
+// CLI-1212 v27: share-token store (file-backed JSON, append-only)
+// ---------------------------------------------------------------------------
+const crypto = require('crypto');
+const SHARE_TOKENS_PATH = path.join(DATA_DIR, '_share_tokens.json');
+const SHARE_TTL_DAYS = parseInt(process.env.PLAYBOOK_SHARE_TTL_DAYS || '7', 10);
+
+function readShareTokens() {
+  try {
+    const raw = fs.readFileSync(SHARE_TOKENS_PATH, 'utf8');
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (_) { return []; }
+}
+function writeShareTokens(arr) {
+  try { fs.writeFileSync(SHARE_TOKENS_PATH, JSON.stringify(arr, null, 2)); }
+  catch (e) { log('share-tokens write error: ' + e.message); }
+}
+function generateShareToken() {
+  return crypto.randomBytes(24).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function findShareToken(token) {
+  const arr = readShareTokens();
+  return arr.find(t => t.token === token) || null;
+}
+function incrementShareView(token) {
+  const arr = readShareTokens();
+  const t = arr.find(x => x.token === token);
+  if (!t) return;
+  t.view_count = (t.view_count || 0) + 1;
+  t.last_viewed_at = new Date().toISOString();
+  writeShareTokens(arr);
+}
+function pruneExpiredShareTokens() {
+  const now = Date.now();
+  const arr = readShareTokens();
+  const kept = arr.filter(t => Date.parse(t.expires_at) > now);
+  if (kept.length !== arr.length) writeShareTokens(kept);
+}
+
+
 function parseRoute(url, method) {
   // /api/playbooks/:slug/action
   const m = url.match(/^\/api\/playbooks\/([^/]+)\/(.+)$/);
@@ -858,6 +900,24 @@ function handleList() {
     entry.totalDiscoveries = Object.values(metrics).reduce((a, b) => a + b, 0);
     entry.phase = determinePhase(slug, entry.source);
 
+    // CLI-1194: surface last_modified so the frontend can sort newest-first.
+    // Use the freshest mtime across step1-company.json, the slug data dir,
+    // and the deployed slug folder. ISO string for easy lexicographic sort.
+    let mtimeMs = 0;
+    try {
+      const t = fs.statSync(path.join(DATA_DIR, slug, 'step1-company.json')).mtimeMs;
+      if (t > mtimeMs) mtimeMs = t;
+    } catch (_) {}
+    try {
+      const t = fs.statSync(path.join(DATA_DIR, slug)).mtimeMs;
+      if (t > mtimeMs) mtimeMs = t;
+    } catch (_) {}
+    try {
+      const t = fs.statSync(path.join(DEPLOY_ROOT, slug)).mtimeMs;
+      if (t > mtimeMs) mtimeMs = t;
+    } catch (_) {}
+    if (mtimeMs > 0) entry.last_modified = new Date(mtimeMs).toISOString();
+
     playbooks.push(entry);
   }
 
@@ -937,6 +997,13 @@ function handleList() {
         phase,
         metrics,
         totalDiscoveries,
+        // CLI-1194: prefer JSON-provided timestamp; fall back to file mtime.
+        last_modified: (function() {
+          if (data.lastUpdated) return data.lastUpdated;
+          if (data.createdAt) return data.createdAt;
+          try { return fs.statSync(path.join(RADAR_DATA_DIR, file)).mtime.toISOString(); }
+          catch (_) { return null; }
+        })(),
       });
     }
   } catch (e) {
@@ -945,6 +1012,235 @@ function handleList() {
 
   return { success: true, playbooks };
 }
+
+// ---------------------------------------------------------------------------
+// CLI-1209 (v25 Wave 2): Hook ranker. Calls Sonnet to extract the 3 to 5 most
+// attention-grabbing signals from a playbook. Output saved to data/<slug>/hooks.json.
+// ---------------------------------------------------------------------------
+const HOOK_COST_CEILING_USD = 0.15;
+
+function readSafeJSON(p) {
+  try { return readJSON(p); } catch (_) { return null; }
+}
+
+async function rankHooks(slug) {
+  const dataDir = path.join(DATA_DIR, slug);
+  if (!fs.existsSync(dataDir)) {
+    throw new Error(`No playbook data for ${slug}`);
+  }
+
+  const ctx = {};
+  const s1 = readSafeJSON(path.join(dataDir, 'step1-company.json'));
+  if (s1 && s1.company) {
+    const c = s1.company;
+    ctx.company = {
+      name: c.name, tagline: c.tagline, sector: c.sector, stage: c.stage, trl: c.trl,
+      website: c.website || c.url, location: c.location || (c.geography && c.geography.hq),
+      summary: c.summary || c.description,
+      funding_to_date: c.funding_to_date, last_round: c.last_round,
+      team_size: c.team_size, founded: c.founded
+    };
+  }
+  const s2 = readSafeJSON(path.join(dataDir, 'step2-investors.json'));
+  if (s2) ctx.top_investors = (s2.investors || []).slice(0, 5).map(i => ({
+    name: i.name, type: i.type, fit_rationale: i.fit_rationale || i.why
+  }));
+  const s3 = readSafeJSON(path.join(dataDir, 'step3-grants.json'));
+  if (s3) ctx.top_grants = (s3.direct_grants || []).slice(0, 5).map(g => ({
+    name: g.name, deadline: g.deadline, amount: g.amount, fit: g.fit_rationale || g.why
+  }));
+  const s4 = readSafeJSON(path.join(dataDir, 'step4-market.json'));
+  if (s4) {
+    ctx.market_signals = (s4.market_signals || []).slice(0, 6).map(m => ({
+      headline: m.headline || m.title, source: m.source, date: m.date, summary: m.summary
+    }));
+    ctx.indigenous_opps = (s4.indigenous_opportunities || []).slice(0, 3);
+    ctx.events = (s4.conference_targets || s4.events || []).slice(0, 3).map(e => ({
+      name: e.name, date: e.date, location: e.location
+    }));
+  }
+  const s5 = readSafeJSON(path.join(dataDir, 'step5-experts.json'));
+  if (s5) ctx.expert_matches = (s5.expert_matches || []).slice(0, 5).map(e => ({
+    name: e.name, expertise: e.expertise, why: e.fit_rationale || e.why
+  }));
+  const s6 = readSafeJSON(path.join(dataDir, 'step6-synthesis.json'));
+  if (s6) {
+    ctx.creative_opportunities = (s6.creative_opportunities || []).slice(0, 5);
+    ctx.alerts = s6.alerts || [];
+  }
+
+  const systemPrompt = `You are a senior climate-tech business development strategist for ClimateDoor. Read the playbook signals and return the 3 to 5 most attention-grabbing hooks ranked by their power to make a busy reader (potential investor, buyer, or partner) want to know more in the first 10 seconds.\n\nHook rules:\n- Each hook is 1 to 2 sentences. No more.\n- Action-oriented voice. Lead with the strongest concrete fact.\n- Include a source attribution inline (the section the data came from).\n- Forbidden: em dashes (use commas, periods, or parentheses), hedging words like "might", "could", "potentially", "perhaps", generic phrases like "innovative solution".\n- Pull the most-recent-and-most-specific signal in each category before generic ones.\n\nHook type categories: funding, hiring, product, press, icp, transcript, network, climate.\n\nOutput ONLY a valid JSON array, nothing else, no markdown fences. Schema:\n[{"rank": 1, "hook_type": "funding", "headline": "...", "supporting_detail": "...", "source_section": "..."}]`;
+
+  const userContent = `Company name: ${(ctx.company && ctx.company.name) || slug}\n\nFull playbook signals (top entries per category):\n${JSON.stringify(ctx, null, 2)}\n\nReturn 3 to 5 hooks ranked by power.`;
+
+  const { text, cost, inputTokens, outputTokens } = await callSonnet(systemPrompt, userContent);
+  if (cost > HOOK_COST_CEILING_USD) {
+    log(`[HOOKS] WARN ${slug} cost ${cost.toFixed(3)} exceeded ceiling ${HOOK_COST_CEILING_USD}`);
+  }
+  let hooks;
+  try {
+    hooks = extractJSON(text);
+  } catch (e) {
+    log(`[HOOKS] ${slug} JSON parse failed; raw length ${text.length}`);
+    throw new Error(`Sonnet output not parseable as JSON: ${e.message}`);
+  }
+  if (!Array.isArray(hooks)) throw new Error('Sonnet output is not an array');
+
+  // Hard guard against em dashes
+  hooks.forEach(h => {
+    ['headline', 'supporting_detail', 'source_section'].forEach(k => {
+      if (typeof h[k] === 'string') h[k] = h[k].replace(/[—–]/g, ',');
+    });
+  });
+
+  const payload = {
+    slug,
+    generated_at: new Date().toISOString(),
+    model: 'claude-sonnet-4-6',
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cost_usd: cost,
+    hooks,
+  };
+  fs.writeFileSync(path.join(dataDir, 'hooks.json'), JSON.stringify(payload, null, 2));
+  log(`[HOOKS] ${slug} ranked ${hooks.length} hooks at $${cost.toFixed(4)}`);
+  return payload;
+}
+
+function readHooksFor(slug) {
+  const p = path.join(DATA_DIR, slug, 'hooks.json');
+  if (!fs.existsSync(p)) return null;
+  return readSafeJSON(p);
+}
+
+// ---------------------------------------------------------------------------
+// CLI-1200 (v24): in-memory tracker for in-flight playbook generations.
+// Populated at handleCreate start, updated on every sendEvent, cleared on
+// complete/error/disconnect. Enables list-level "running" badge so the user
+// keeps visibility even after closing the modal.
+// ---------------------------------------------------------------------------
+const runningPlaybooks = new Map();
+
+function trackRunningStart(slug, company_name) {
+  runningPlaybooks.set(slug, {
+    slug,
+    company_name: company_name || slug,
+    started_at: new Date().toISOString(),
+    current_step: 0,
+    current_label: 'Initializing',
+    last_event_at: new Date().toISOString(),
+  });
+}
+
+function trackRunningEvent(slug, eventType, data) {
+  const entry = runningPlaybooks.get(slug);
+  if (!entry) return;
+  entry.last_event_at = new Date().toISOString();
+  if (eventType === 'status' && data && typeof data.step !== 'undefined') {
+    entry.current_step = data.step;
+    if (data.label) entry.current_label = data.label;
+  } else if (eventType === 'step_done' && data && typeof data.step !== 'undefined') {
+    entry.current_step = data.step;
+    entry.current_label = `Step ${data.step} complete`;
+  }
+}
+
+function trackRunningEnd(slug) {
+  runningPlaybooks.delete(slug);
+}
+
+function handleRunning() {
+  const running = [];
+  for (const [, entry] of runningPlaybooks) {
+    running.push({
+      slug: entry.slug,
+      company_name: entry.company_name,
+      started_at: entry.started_at,
+      current_step: entry.current_step,
+      current_label: entry.current_label,
+      last_event_at: entry.last_event_at,
+    });
+  }
+  return { success: true, running };
+}
+
+// ---------------------------------------------------------------------------
+// CLI-1192: lightweight search for typeahead-while-filling on the new-playbook
+// modal. Scans DEPLOY_ROOT for slug folders, reads step1-company.json (lazily)
+// for richer name/url/sector match, returns top N substring matches.
+// Avoids re-running handleList's heavy metrics aggregation.
+// ---------------------------------------------------------------------------
+function handleSearch(q, limit) {
+  q = (q || '').trim().toLowerCase();
+  if (!q || q.length < 2) return { success: true, results: [] };
+
+  const results = [];
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(DEPLOY_ROOT).filter(d => {
+      if (d === 'editor') return false;
+      try {
+        const dp = path.join(DEPLOY_ROOT, d);
+        return fs.statSync(dp).isDirectory() && fs.existsSync(path.join(dp, 'index.html'));
+      } catch (_) { return false; }
+    });
+  } catch (e) {
+    return { success: true, results: [] };
+  }
+
+  for (const slug of dirs) {
+    let name = slug;
+    let url = '';
+    let sector = '';
+    let hq = '';
+    let lastRun = null;
+
+    const step1Path = path.join(DATA_DIR, slug, 'step1-company.json');
+    if (fs.existsSync(step1Path)) {
+      try {
+        const s1 = readJSON(step1Path);
+        const c = s1.company || {};
+        name = c.name || slug;
+        url = c.website || c.url || '';
+        sector = c.sector || '';
+        hq = (c.geography && c.geography.hq) || c.location || '';
+        const stat = fs.statSync(step1Path);
+        lastRun = stat.mtime.toISOString();
+      } catch (_) {}
+    } else {
+      try {
+        const stat = fs.statSync(path.join(DEPLOY_ROOT, slug));
+        lastRun = stat.mtime.toISOString();
+      } catch (_) {}
+    }
+
+    const haystack = [slug, name, url, sector, hq].join(' ').toLowerCase();
+    if (!haystack.includes(q)) continue;
+
+    // Score: exact-name and slug-prefix beat substring; recent beats stale.
+    let score = 0;
+    if (name.toLowerCase() === q) score += 1000;
+    if (slug.toLowerCase().startsWith(q)) score += 200;
+    if (name.toLowerCase().startsWith(q)) score += 150;
+    if (haystack.indexOf(q) >= 0) score += 50;
+    if (lastRun) {
+      const ageDays = (Date.now() - new Date(lastRun).getTime()) / 86400000;
+      score += Math.max(0, 30 - ageDays); // recent ~+30, year-old ~0
+    }
+
+    results.push({ slug, name, url, sector, hq, last_run: lastRun, score });
+  }
+
+  results.sort((a, b) => b.score - a.score);
+  const top = results.slice(0, limit).map(r => {
+    const out = { slug: r.slug, name: r.name, url: r.url, last_run: r.last_run, source: 'pipeline' };
+    if (r.sector) out.sector = r.sector;
+    if (r.hq) out.hq = r.hq;
+    return out;
+  });
+  return { success: true, results: top };
+}
+
 // ---------------------------------------------------------------------------
 // Create new playbook (full pipeline, SSE progress)
 // ---------------------------------------------------------------------------
@@ -1050,7 +1346,22 @@ async function handleCreate(req, res) {
     'Access-Control-Allow-Origin': '*',
   });
 
+  // CLI-1200: register run + cleanup on client disconnect.
+  trackRunningStart(slug, company_name);
+  req.on('close', () => {
+    if (runningPlaybooks.has(slug)) {
+      const entry = runningPlaybooks.get(slug);
+      // Only purge if pipeline never completed; otherwise complete/error already cleared it.
+      if (entry && entry.current_step < 7) {
+        log(`[CREATE] Client disconnected mid-run for ${slug} at step ${entry.current_step}; clearing tracker entry`);
+        trackRunningEnd(slug);
+      }
+    }
+  });
+
   function sendEvent(event, data) {
+    trackRunningEvent(slug, event, data);
+    if (event === 'complete' || event === 'error') trackRunningEnd(slug);
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   }
 
@@ -1169,6 +1480,25 @@ async function handleCreate(req, res) {
 // HTTP Server
 // ---------------------------------------------------------------------------
 const server = http.createServer(async (req, res) => {
+  // CLI-235 basic auth (shared realm ClimateDoor)
+  const _authPublic = req.url === '/health' || req.url === '/api/health' || (req.url && req.url.startsWith('/health/')) || (req.url && /^(?:\/playbooks)?\/share\/[A-Za-z0-9_-]{16,}(?:\?|$)/.test(req.url));
+  if (!_authPublic) {
+    const _ah = req.headers.authorization || '';
+    const _parts = _ah.split(' ');
+    let _ok = false;
+    if (_parts[0] === 'Basic' && _parts[1]) {
+      const _dec = Buffer.from(_parts[1], 'base64').toString('utf8');
+      const _sep = _dec.indexOf(':');
+      const _u = _dec.slice(0, _sep);
+      const _p = _dec.slice(_sep + 1);
+      if (_u === process.env.AUTH_USER && _p === process.env.AUTH_PASS) _ok = true;
+    }
+    if (!_ok) {
+      res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="ClimateDoor"' });
+      return res.end('Authentication required');
+    }
+  }
+
   // CORS preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -1186,6 +1516,118 @@ const server = http.createServer(async (req, res) => {
     log('GET /api/playbooks/_list');
     try {
       return sendJSON(res, 200, handleList());
+    } catch (err) {
+      log(`ERROR: ${err.message}`);
+      return sendJSON(res, 500, { error: err.message });
+    }
+  }
+
+  // CLI-1209 (v25 Wave 2): hook ranker endpoints.
+  // GET  /api/playbooks/<slug>/hooks            -> read existing hooks.json or 404
+  // POST /api/playbooks/<slug>/hooks/regenerate -> Sonnet call + write + return
+  {
+    const hookGetMatch = parsedUrl.pathname.match(/^\/api\/playbooks\/([a-z0-9-]+)\/hooks$/i);
+    if (hookGetMatch && req.method === 'GET') {
+      const slug = hookGetMatch[1];
+      log(`GET /api/playbooks/${slug}/hooks`);
+      const data = readHooksFor(slug);
+      if (!data) return sendJSON(res, 404, { error: `No hooks for ${slug}; trigger regenerate first` });
+      return sendJSON(res, 200, data);
+    }
+    const hookRegenMatch = parsedUrl.pathname.match(/^\/api\/playbooks\/([a-z0-9-]+)\/hooks\/regenerate$/i);
+    if (hookRegenMatch && req.method === 'POST') {
+      const slug = hookRegenMatch[1];
+      log(`POST /api/playbooks/${slug}/hooks/regenerate`);
+      try {
+        const result = await rankHooks(slug);
+        return sendJSON(res, 200, result);
+      } catch (err) {
+        log(`ERROR rankHooks: ${err.message}`);
+        return sendJSON(res, 500, { error: err.message });
+      }
+    }
+  }
+
+  
+  // CLI-1212 v27: shareable token endpoints.
+  // POST /api/playbooks/<slug>/export/share -> create token + return url
+  // GET  /playbooks/share/<token>           -> validate, increment, redirect to /playbooks/<slug>/?share=<token>
+  {
+    const shareCreateMatch = parsedUrl.pathname.match(/^\/api\/playbooks\/([a-z0-9-]+)\/export\/share$/i);
+    if (shareCreateMatch && req.method === 'POST') {
+      const slug = shareCreateMatch[1];
+      log(`POST /api/playbooks/${slug}/export/share`);
+      try {
+        const slugDir = path.join(DEPLOY_ROOT, slug);
+        if (!fs.existsSync(slugDir)) {
+          return sendJSON(res, 404, { error: `Playbook ${slug} not found` });
+        }
+        pruneExpiredShareTokens();
+        const token = generateShareToken();
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + SHARE_TTL_DAYS * 86400000);
+        const arr = readShareTokens();
+        const record = {
+          token,
+          slug,
+          created_at: now.toISOString(),
+          expires_at: expiresAt.toISOString(),
+          view_count: 0
+        };
+        arr.push(record);
+        writeShareTokens(arr);
+        return sendJSON(res, 200, {
+          token,
+          url: `/playbooks/share/${token}`,
+          expires_at: record.expires_at,
+          expires_at_human: expiresAt.toUTCString(),
+          ttl_days: SHARE_TTL_DAYS
+        });
+      } catch (err) {
+        log(`ERROR share-create: ${err.message}`);
+        return sendJSON(res, 500, { error: err.message });
+      }
+    }
+    const shareViewMatch = parsedUrl.pathname.match(/^(?:\/playbooks)?\/share\/([A-Za-z0-9_-]{16,})$/);
+    if (shareViewMatch && req.method === 'GET') {
+      const token = shareViewMatch[1];
+      log(`GET /playbooks/share/${token.slice(0, 8)}...`);
+      const record = findShareToken(token);
+      if (!record) {
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end('<h1>Share link not found</h1><p>This link does not exist.</p>');
+      }
+      if (Date.parse(record.expires_at) < Date.now()) {
+        res.writeHead(410, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end('<h1>Share link expired</h1><p>Ask the sender for a fresh link.</p>');
+      }
+      incrementShareView(token);
+      const target = `/playbooks/${record.slug}/?share=${encodeURIComponent(token)}`;
+      res.writeHead(302, { Location: target, 'Cache-Control': 'no-store' });
+      return res.end();
+    }
+  }
+
+  // CLI-1200: list-level running visibility.
+  // GET /api/playbooks/_running -> { running: [{ slug, company_name, current_step, current_label, ... }] }
+  if (parsedUrl.pathname === '/api/playbooks/_running' && req.method === 'GET') {
+    log('GET /api/playbooks/_running');
+    try {
+      return sendJSON(res, 200, handleRunning());
+    } catch (err) {
+      log(`ERROR: ${err.message}`);
+      return sendJSON(res, 500, { error: err.message });
+    }
+  }
+
+  // CLI-1192: lightweight search-while-filling endpoint.
+  // GET /api/playbooks/search?q=<query>&limit=5 -> [{ slug, name, url, last_run, source }]
+  if (parsedUrl.pathname === '/api/playbooks/search' && req.method === 'GET') {
+    log(`GET /api/playbooks/search?q=${parsedUrl.searchParams.get('q') || ''}`);
+    try {
+      const q = (parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
+      const limit = Math.min(20, Math.max(1, Number(parsedUrl.searchParams.get('limit')) || 5));
+      return sendJSON(res, 200, handleSearch(q, limit));
     } catch (err) {
       log(`ERROR: ${err.message}`);
       return sendJSON(res, 500, { error: err.message });
