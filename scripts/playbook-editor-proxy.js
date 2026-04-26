@@ -402,6 +402,182 @@ function pruneExpiredShareTokens() {
 }
 
 // ---------------------------------------------------------------------------
+// CLI-1212-3a v28: DOCX export.
+// ---------------------------------------------------------------------------
+const docxLib = require('docx');
+
+function readPlaybookSection(slug, file) {
+  try {
+    const fp = path.join(DATA_DIR, slug, file);
+    if (!fs.existsSync(fp)) return null;
+    return JSON.parse(fs.readFileSync(fp, 'utf8'));
+  } catch (_) { return null; }
+}
+
+const _DOCX_CTRL_RE = new RegExp('[\\x00-\\x1f\\x7f]', 'g');
+function docxSafe(s, max) {
+  if (s == null) return '';
+  s = String(s).replace(_DOCX_CTRL_RE, '');
+  if (max && s.length > max) s = s.slice(0, max - 1) + '...';
+  return s;
+}
+
+function buildPlaybookDocx(slug) {
+  const step1 = readPlaybookSection(slug, 'step1-company.json') || {};
+  const hooksData = readPlaybookSection(slug, 'hooks.json');
+  const step2 = readPlaybookSection(slug, 'step2-investors.json');
+  const step2b = readPlaybookSection(slug, 'step2b-contacts.json');
+  const step3 = readPlaybookSection(slug, 'step3-grants.json');
+  const step4 = readPlaybookSection(slug, 'step4-market.json');
+  const step5 = readPlaybookSection(slug, 'step5-experts.json');
+  const step6 = readPlaybookSection(slug, 'step6-synthesis.json');
+
+  const company = (step1.company && step1.company.name) || slug;
+  const description = step1.company && step1.company.description || '';
+  const sector = step1.company && step1.company.sub_sector || step1.company && step1.company.sector || '';
+  const stage = step1.company && step1.company.stage || '';
+  const dateStr = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+  const { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Footer, PageNumber, BorderStyle } = docxLib;
+
+  const para = (text, opts) => new Paragraph(Object.assign({
+    children: [new TextRun({ text: docxSafe(text, 4000), font: 'Montserrat' })]
+  }, opts || {}));
+
+  const heading = (text, level) => new Paragraph({
+    heading: level || HeadingLevel.HEADING_1,
+    spacing: { before: 280, after: 140 },
+    children: [new TextRun({ text: docxSafe(text, 200), font: 'Montserrat', bold: true, color: '1a2e31' })]
+  });
+
+  const children = [];
+
+  children.push(new Paragraph({
+    spacing: { after: 60 },
+    children: [new TextRun({ text: 'CLIMATEDOOR', font: 'Montserrat', bold: true, color: 'C89060', size: 22 })]
+  }));
+  children.push(new Paragraph({
+    spacing: { after: 200 },
+    border: { bottom: { color: 'C89060', space: 4, style: BorderStyle.SINGLE, size: 6 } },
+    children: [
+      new TextRun({ text: 'Pre-Call Intelligence  |  ', font: 'Montserrat', color: '5E807B', size: 18 }),
+      new TextRun({ text: company + '  |  Generated ' + dateStr, font: 'Montserrat', color: '777777', size: 16 })
+    ]
+  }));
+
+  children.push(new Paragraph({
+    spacing: { after: 200 },
+    children: [new TextRun({ text: company, font: 'Montserrat', bold: true, size: 36, color: '1a2e31' })]
+  }));
+  if (sector || stage) {
+    children.push(para([sector, stage].filter(Boolean).join(' / '), { spacing: { after: 200 } }));
+  }
+  if (description) {
+    children.push(para(description, { spacing: { after: 240 } }));
+  }
+
+  if (hooksData && Array.isArray(hooksData.hooks) && hooksData.hooks.length > 0) {
+    children.push(heading('Top hooks', HeadingLevel.HEADING_2));
+    hooksData.hooks.forEach(function(h, i) {
+      children.push(new Paragraph({
+        spacing: { before: 80, after: 30 },
+        children: [
+          new TextRun({ text: (i + 1) + '. ', font: 'Montserrat', bold: true, color: 'C89060' }),
+          new TextRun({ text: docxSafe(h.headline || '', 800), font: 'Montserrat', bold: true, color: '1a2e31' })
+        ]
+      }));
+      if (h.supporting_detail) {
+        children.push(para(h.supporting_detail, { spacing: { after: 120 } }));
+      }
+    });
+  }
+
+  function addSection(title, data, extractor) {
+    if (!data) return;
+    children.push(heading(title, HeadingLevel.HEADING_2));
+    try {
+      const items = extractor(data);
+      if (!items || items.length === 0) {
+        children.push(para('No data.', { spacing: { after: 120 } }));
+        return;
+      }
+      items.forEach(function(it) {
+        children.push(new Paragraph({
+          spacing: { before: 80, after: 20 },
+          children: [new TextRun({ text: docxSafe(it.title, 200), font: 'Montserrat', bold: true })]
+        }));
+        if (it.detail) children.push(para(it.detail, { spacing: { after: 120 } }));
+      });
+    } catch (e) {
+      children.push(para('Section render failed: ' + e.message, { spacing: { after: 120 } }));
+    }
+  }
+
+  addSection('Investor matches', step2, function(d) {
+    const list = (d && d.investors) || (d && d.matches) || [];
+    return list.slice(0, 20).map(function(i) {
+      return { title: i.name || i.firm || 'Unnamed', detail: [i.thesis, i.url, i.rationale].filter(Boolean).join(' | ') };
+    });
+  });
+  addSection('Buyer / contact intelligence', step2b, function(d) {
+    const list = (d && d.contacts) || (d && d.matches) || [];
+    return list.slice(0, 20).map(function(c) {
+      return { title: [c.name, c.title].filter(Boolean).join(' / ') || 'Unnamed contact', detail: [c.company, c.email, c.linkedin_url].filter(Boolean).join(' | ') };
+    });
+  });
+  addSection('Grants', step3, function(d) {
+    const list = (d && d.grants) || (d && d.matches) || [];
+    return list.slice(0, 20).map(function(g) {
+      return { title: g.title || g.name || 'Untitled grant', detail: [g.funder, g.amount, g.deadline, g.url].filter(Boolean).join(' | ') };
+    });
+  });
+  addSection('Market signals', step4, function(d) {
+    const list = (d && d.signals) || (d && d.matches) || (d && d.events) || [];
+    return list.slice(0, 20).map(function(s) {
+      return { title: s.title || s.name || 'Signal', detail: [s.summary, s.url, s.date].filter(Boolean).join(' | ') };
+    });
+  });
+  addSection('Experts', step5, function(d) {
+    const list = (d && d.experts) || (d && d.matches) || [];
+    return list.slice(0, 20).map(function(e) {
+      return { title: [e.name, e.title].filter(Boolean).join(' / ') || 'Unnamed', detail: [e.affiliation, e.linkedin_url, e.expertise].filter(Boolean).join(' | ') };
+    });
+  });
+
+  if (step6) {
+    children.push(heading('Synthesis', HeadingLevel.HEADING_2));
+    const text = (step6 && step6.synthesis) || (step6 && step6.summary) || JSON.stringify(step6).slice(0, 4000);
+    children.push(para(text, { spacing: { after: 200 } }));
+  }
+
+  const footer = new Footer({
+    children: [new Paragraph({
+      alignment: AlignmentType.CENTER,
+      children: [
+        new TextRun({ text: 'Confidential. For internal use.   |   Page ', font: 'Montserrat', size: 14, color: '777777' }),
+        new TextRun({ children: [PageNumber.CURRENT], font: 'Montserrat', size: 14, color: '777777' }),
+        new TextRun({ text: ' of ', font: 'Montserrat', size: 14, color: '777777' }),
+        new TextRun({ children: [PageNumber.TOTAL_PAGES], font: 'Montserrat', size: 14, color: '777777' })
+      ]
+    })]
+  });
+
+  const doc = new Document({
+    creator: 'ClimateDoor',
+    title: company + ' Playbook',
+    styles: { default: { document: { run: { font: 'Montserrat' } } } },
+    sections: [{
+      properties: { page: { margin: { top: 720, right: 720, bottom: 900, left: 720 } } },
+      footers: { default: footer },
+      children
+    }]
+  });
+
+  return Packer.toBuffer(doc);
+}
+
+
+// ---------------------------------------------------------------------------
 // CLI-1193 v27: concurrency semaphore (default 5 simultaneous playbook runs)
 // ---------------------------------------------------------------------------
 const PLAYBOOK_MAX_CONCURRENT = parseInt(process.env.PLAYBOOK_MAX_CONCURRENT || '5', 10);
@@ -1654,6 +1830,35 @@ const server = http.createServer(async (req, res) => {
       const target = `/playbooks/${record.slug}/?share=${encodeURIComponent(token)}`;
       res.writeHead(302, { Location: target, 'Cache-Control': 'no-store' });
       return res.end();
+    }
+
+    const docxMatch = parsedUrl.pathname.match(/^\/api\/playbooks\/([a-z0-9-]+)\/export\/docx$/i);
+    if (docxMatch && req.method === 'POST') {
+      const slug = docxMatch[1];
+      log(`POST /api/playbooks/${slug}/export/docx`);
+      try {
+        const slugDir = path.join(DEPLOY_ROOT, slug);
+        if (!fs.existsSync(slugDir)) return sendJSON(res, 404, { error: `Playbook ${slug} not found` });
+        const buf = await buildPlaybookDocx(slug);
+        let company = slug;
+        try {
+          const s1 = JSON.parse(fs.readFileSync(path.join(DATA_DIR, slug, 'step1-company.json'), 'utf8'));
+          if (s1 && s1.company && s1.company.name) company = s1.company.name;
+        } catch (_) {}
+        const dateStamp = new Date().toISOString().slice(0, 10);
+        const safeName = company.replace(/[^A-Za-z0-9 ._-]+/g, '').slice(0, 60).trim() || slug;
+        const filename = safeName + ' Playbook ' + dateStamp + '.docx';
+        res.writeHead(200, {
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'Content-Disposition': 'attachment; filename="' + filename.replace(/"/g, '') + '"',
+          'Content-Length': buf.length,
+          'Access-Control-Allow-Origin': '*'
+        });
+        return res.end(buf);
+      } catch (err) {
+        log(`ERROR docx export: ${err.message}`);
+        return sendJSON(res, 500, { error: 'docx_failed', detail: err.message.slice(0, 400) });
+      }
     }
   }
 
