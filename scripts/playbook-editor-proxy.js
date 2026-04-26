@@ -401,6 +401,41 @@ function pruneExpiredShareTokens() {
   if (kept.length !== arr.length) writeShareTokens(kept);
 }
 
+// ---------------------------------------------------------------------------
+// CLI-1193 v27: concurrency semaphore (default 5 simultaneous playbook runs)
+// ---------------------------------------------------------------------------
+const PLAYBOOK_MAX_CONCURRENT = parseInt(process.env.PLAYBOOK_MAX_CONCURRENT || '5', 10);
+let _activeRuns = 0;
+const _waitingResolvers = [];
+
+function acquireRunSlot(slug, sendEvent) {
+  if (_activeRuns < PLAYBOOK_MAX_CONCURRENT) {
+    _activeRuns++;
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    const position = _waitingResolvers.length + 1;
+    if (sendEvent) {
+      sendEvent('queued', { slug, position, max_concurrent: PLAYBOOK_MAX_CONCURRENT, active: _activeRuns });
+    }
+    _waitingResolvers.push(() => {
+      _activeRuns++;
+      resolve(true);
+    });
+  });
+}
+
+function releaseRunSlot() {
+  _activeRuns = Math.max(0, _activeRuns - 1);
+  const next = _waitingResolvers.shift();
+  if (next) next();
+}
+
+function semaphoreSnapshot() {
+  return { active: _activeRuns, queued: _waitingResolvers.length, max_concurrent: PLAYBOOK_MAX_CONCURRENT };
+}
+
+
 
 function parseRoute(url, method) {
   // /api/playbooks/:slug/action
@@ -1147,6 +1182,8 @@ function trackRunningEvent(slug, eventType, data) {
 
 function trackRunningEnd(slug) {
   runningPlaybooks.delete(slug);
+  // CLI-1193 v27: release semaphore slot. Idempotent if no slot was held.
+  releaseRunSlot();
 }
 
 function handleRunning() {
@@ -1366,6 +1403,18 @@ async function handleCreate(req, res) {
   }
 
   sendEvent('status', { step: 0, label: 'Initializing', slug });
+
+  // CLI-1193 v27: acquire run slot. Sends 'queued' SSE event if at capacity.
+  let _wasQueued = false;
+  try {
+    _wasQueued = await acquireRunSlot(slug, sendEvent);
+    if (_wasQueued) {
+      sendEvent('status', { step: 0, label: 'Slot acquired, starting now', slug });
+    }
+  } catch (slotErr) {
+    sendEvent('error', { step: 0, message: 'Slot acquisition failed: ' + slotErr.message });
+    return;
+  }
 
   // Ensure data directory
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
@@ -1613,7 +1662,9 @@ const server = http.createServer(async (req, res) => {
   if (parsedUrl.pathname === '/api/playbooks/_running' && req.method === 'GET') {
     log('GET /api/playbooks/_running');
     try {
-      return sendJSON(res, 200, handleRunning());
+      const base = handleRunning();
+      const sem = semaphoreSnapshot();
+      return sendJSON(res, 200, Object.assign({}, base, sem));
     } catch (err) {
       log(`ERROR: ${err.message}`);
       return sendJSON(res, 500, { error: err.message });
