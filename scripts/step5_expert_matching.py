@@ -23,6 +23,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 import anthropic
 
+# CC-dispatch pivot (2026-05-23): when CD_USE_CC_DISPATCH=1 and the
+# transport is wired, this step routes through CC instead of the
+# Anthropic API. The legacy Anthropic path remains as the fallback so
+# behaviour does not change until both the env var is set and CC-D's
+# dispatch_to_cc transport is in place.
+sys.path.insert(0, "/home/openclaw/playbook-skill")
+from generator.prompts.cc_dispatch_contract import (
+    wrap_prompt_for_cc,
+    parse_cc_result,
+    CCResultParseError,
+)
+from generator.prompts.cc_dispatch_runner import (
+    dispatch_to_cc,
+    is_dispatch_enabled,
+    CCDispatchUnavailable,
+)
+
 SONNET_MODEL = "claude-sonnet-4-6"
 SKILL_ROOT = Path("/home/openclaw/playbook-skill")
 EXPERTS_PATH = Path("/home/openclaw/radar-platform/data/experts.json")
@@ -163,12 +180,37 @@ Output a JSON object with two arrays:
 
 Output ONLY the JSON object."""
 
+    system_prompt = (
+        "You are a talent matching analyst for ClimateDoor. Match experts to "
+        "companies based on actual expertise, not assumptions. Bios come from "
+        "the database, NEVER generated. Output valid JSON only."
+    )
+
+    # CC-dispatch path: opt-in, falls through to Anthropic on any failure
+    # so a single env flag flip can be safely reverted.
+    if is_dispatch_enabled():
+        try:
+            print(f"  Dispatching via CC (CD_USE_CC_DISPATCH=1)...")
+            t0 = time.time()
+            wrapped = wrap_prompt_for_cc(user_msg, "step5_expert_rationale")
+            raw_cc = dispatch_to_cc(
+                prompt=wrapped, system=system_prompt,
+                model="sonnet", max_tokens=8000,
+            )
+            data = parse_cc_result(raw_cc, "step5_expert_rationale")
+            elapsed = time.time() - t0
+            print(f"  CC responded in {elapsed:.1f}s")
+            return data
+        except (CCDispatchUnavailable, CCResultParseError) as e:
+            print(f"  [WARN] CC dispatch failed ({type(e).__name__}: {e}); "
+                  f"falling back to Anthropic API path")
+
     print(f"  Calling Sonnet for expert rationales...")
     t0 = time.time()
     response = client.messages.create(
         model=SONNET_MODEL,
         max_tokens=8000,
-        system="You are a talent matching analyst for ClimateDoor. Match experts to companies based on actual expertise, not assumptions. Bios come from the database, NEVER generated. Output valid JSON only.",
+        system=system_prompt,
         messages=[{"role": "user", "content": user_msg}],
     )
     elapsed = time.time() - t0
