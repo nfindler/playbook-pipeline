@@ -1792,8 +1792,12 @@ async function handleCreate(req, res) {
 // ---------------------------------------------------------------------------
 const server = http.createServer(async (req, res) => {
   // CLI-235 basic auth (shared realm ClimateDoor)
+  // CLI-1240 v78d: when CD_TRUST_COOKIE_AUTH=1, accept the cd_session cookie
+  // (set by radar /auth/session) instead of basic-auth credentials.
   const _authPublic = req.url === '/health' || req.url === '/api/health' || (req.url && req.url.startsWith('/health/')) || (req.url && /^(?:\/playbooks)?\/share\/[A-Za-z0-9_-]{16,}(?:\?|$)/.test(req.url));
-  if (!_authPublic) {
+  const _cookieRaw = req.headers && req.headers.cookie || '';
+  const _hasCdSession = /(?:^|;\s*)cd_session=/.test(_cookieRaw);
+  if (!_authPublic && !(process.env.CD_TRUST_COOKIE_AUTH === '1' && _hasCdSession)) {
     const _ah = req.headers.authorization || '';
     const _parts = _ah.split(' ');
     let _ok = false;
