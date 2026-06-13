@@ -31,7 +31,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
+import cc_anthropic as anthropic  # CLI-2785: the $0 cc-dispatch transport (the metered SDK stays dark behind serving_mode)
 
 SONNET_MODEL = "claude-sonnet-4-6"
 SKILL_ROOT = Path("/home/openclaw/playbook-skill")
