@@ -115,7 +115,8 @@ def run_step6(slug: str) -> Path:
     system_prompt = load_system_prompt()
     steps = load_all_steps(slug)
 
-    company_name = steps.get("step1_company", {}).get("company", {}).get("name", slug)
+    # step1 may emit an explicit null name (honest-unknown); fall back to the slug.
+    company_name = ((steps.get("step1_company") or {}).get("company") or {}).get("name") or slug
     print(f"{'='*60}")
     print(f"STEP 6: Strategic Synthesis (Opus)")
     print(f"Company: {company_name}")

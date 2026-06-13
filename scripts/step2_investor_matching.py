@@ -120,8 +120,8 @@ def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict]:
 
 def pass1_direct_sector(conn: sqlite3.Connection, company: dict) -> list[dict]:
     """Query investors whose industry_preferred matches the company's sector."""
-    sector = company.get("company", {}).get("sector", "Other")
-    sub_sector = company.get("company", {}).get("sub_sector", "")
+    sector = (company.get("company") or {}).get("sector") or "Other"
+    sub_sector = (company.get("company") or {}).get("sub_sector") or ""
 
     # Get the DB terms for this sector
     db_terms = SECTOR_TO_DB_TERMS.get(sector, ["Climate / Cleantech General"])
@@ -171,8 +171,8 @@ def pass1_direct_sector(conn: sqlite3.Connection, company: dict) -> list[dict]:
 
 def pass2_stage_geography(conn: sqlite3.Connection, company: dict) -> list[dict]:
     """Stage + geography match regardless of sector. Catches active generalists."""
-    stage = company.get("company", {}).get("stage", "")
-    geo = company.get("company", {}).get("geography", {})
+    stage = (company.get("company") or {}).get("stage") or ""
+    geo = (company.get("company") or {}).get("geography") or {}
     country = "Canada"  # Frett is in Quebec, Canada
     if geo.get("hq"):
         hq = geo["hq"]
@@ -238,7 +238,7 @@ def pass2_stage_geography(conn: sqlite3.Connection, company: dict) -> list[dict]
 
 def pass3_adjacent_sector(conn: sqlite3.Connection, company: dict) -> list[dict]:
     """Query investors in adjacent sectors that overlap with the company's space."""
-    sector = company.get("company", {}).get("sector", "Other")
+    sector = (company.get("company") or {}).get("sector") or "Other"
     adjacent = ADJACENT_SECTORS.get(sector, ["Climate / Cleantech General"])
 
     # Exclude terms already used in Pass 1
@@ -347,8 +347,8 @@ def merge_passes(passes: dict[str, list[dict]]) -> dict[str, dict]:
 
 def score_thesis_fit(inv: dict, company: dict) -> int:
     """Factor 1: How well does industry_preferred align with company sector?"""
-    sector = company.get("company", {}).get("sector", "")
-    sub_sector = company.get("company", {}).get("sub_sector", "")
+    sector = (company.get("company") or {}).get("sector") or ""
+    sub_sector = (company.get("company") or {}).get("sub_sector") or ""
     industry = (inv.get("industry_preferred") or "").lower()
 
     if not industry:
@@ -386,7 +386,7 @@ def score_thesis_fit(inv: dict, company: dict) -> int:
 
 def score_stage_fit(inv: dict, company: dict) -> int:
     """Factor 2: Does investor's stage preference match company's stage?"""
-    company_stage = company.get("company", {}).get("stage", "")
+    company_stage = (company.get("company") or {}).get("stage") or ""
     inv_stages = (inv.get("stage_preferred") or "").lower()
 
     if not inv_stages:
@@ -434,8 +434,10 @@ def score_stage_fit(inv: dict, company: dict) -> int:
 
 def score_geo_fit(inv: dict, company: dict) -> int:
     """Factor 3: Geography alignment."""
-    geo = company.get("company", {}).get("geography", {})
-    hq = geo.get("hq", "")
+    # step1 emits explicit nulls for honest-unknowns; .get's default only covers
+    # a MISSING key, so coalesce the values themselves.
+    geo = (company.get("company") or {}).get("geography") or {}
+    hq = geo.get("hq") or ""
 
     inv_region = (inv.get("preferred_region") or "").lower()
     inv_country = (inv.get("country") or "").lower()
@@ -513,11 +515,11 @@ def score_portfolio_signal(inv: dict, company: dict) -> int:
     climate_inv = inv.get("climate_investments") or 0
     industry = (inv.get("industry_preferred") or "").lower()
 
-    sector = company.get("company", {}).get("sector", "").lower()
+    sector = ((company.get("company") or {}).get("sector") or "").lower()
 
     if climate_inv >= 21:
         # Active portfolio, likely some overlap
-        if any(t.lower() in industry for t in SECTOR_TO_DB_TERMS.get(company.get("company", {}).get("sector", "Other"), [])):
+        if any(t.lower() in industry for t in SECTOR_TO_DB_TERMS.get((company.get("company") or {}).get("sector") or "Other", [])):
             return 75  # Active in the sector
         return 55  # Active but different sectors
     elif climate_inv >= 1:
@@ -609,28 +611,30 @@ Output a JSON array of objects, one per investor."""
 
 def build_company_summary(company: dict) -> dict:
     """Build a compact company summary for Sonnet prompts."""
-    comp = company.get("company", {})
-    product = company.get("product", {})
-    traction = company.get("traction", {})
+    # step1 emits explicit nulls for honest-unknowns; .get's default only covers
+    # a MISSING key, so coalesce the values themselves.
+    comp = company.get("company") or {}
+    product = company.get("product") or {}
+    traction = company.get("traction") or {}
     return {
-        "name": comp.get("name", ""),
-        "sector": comp.get("sector", ""),
-        "sub_sector": comp.get("sub_sector", ""),
-        "stage": comp.get("stage", ""),
-        "trl": comp.get("trl", ""),
-        "geography": comp.get("geography", {}),
-        "description": comp.get("description", ""),
-        "product_description": product.get("description", ""),
-        "key_claims": [c.get("claim", "") for c in product.get("key_claims", [])[:5]],
+        "name": comp.get("name") or "",
+        "sector": comp.get("sector") or "",
+        "sub_sector": comp.get("sub_sector") or "",
+        "stage": comp.get("stage") or "",
+        "trl": comp.get("trl") or "",
+        "geography": comp.get("geography") or {},
+        "description": comp.get("description") or "",
+        "product_description": product.get("description") or "",
+        "key_claims": [c.get("claim") or "" for c in (product.get("key_claims") or [])[:5]],
         "regulatory": {
-            k: v.get("status", "") for k, v in product.get("regulatory_status", {}).items()
+            k: (v or {}).get("status") or "" for k, v in (product.get("regulatory_status") or {}).items()
         },
-        "patents": [p.get("title", "") for p in product.get("ip", {}).get("patents", [])],
-        "government_traction": traction.get("government_buyer_traction", False),
-        "logos": [l.get("name", "") for l in traction.get("website_logos", [])],
-        "target_buyers": company.get("market", {}).get("target_buyers", []),
-        "data_gaps": company.get("data_gaps", [])[:5],
-        "funding": company.get("funding", {}),
+        "patents": [p.get("title") or "" for p in (product.get("ip") or {}).get("patents") or []],
+        "government_traction": traction.get("government_buyer_traction") or False,
+        "logos": [l.get("name") or "" for l in traction.get("website_logos") or []],
+        "target_buyers": (company.get("market") or {}).get("target_buyers") or [],
+        "data_gaps": (company.get("data_gaps") or [])[:5],
+        "funding": company.get("funding") or {},
     }
 
 

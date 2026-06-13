@@ -62,11 +62,13 @@ def load_experts() -> list[dict]:
 
 def match_experts_to_company(experts: list[dict], company: dict) -> list[dict]:
     """Score each expert against the company profile using keyword matching."""
-    comp = company.get("company", {})
-    sector = (comp.get("sector", "") + " " + comp.get("sub_sector", "")).lower()
-    geo = comp.get("geography", {}).get("hq", "").lower()
-    product = company.get("product", {}).get("description", "").lower()
-    buyers = " ".join(company.get("market", {}).get("target_buyers", [])).lower()
+    # step1 emits explicit nulls for honest-unknowns; .get's default only covers
+    # a MISSING key, so coalesce the values themselves.
+    comp = company.get("company") or {}
+    sector = ((comp.get("sector") or "") + " " + (comp.get("sub_sector") or "")).lower()
+    geo = ((comp.get("geography") or {}).get("hq") or "").lower()
+    product = ((company.get("product") or {}).get("description") or "").lower()
+    buyers = " ".join((company.get("market") or {}).get("target_buyers") or []).lower()
 
     # Keywords to match
     sector_kw = ["circular", "textile", "fashion", "sustainable", "recycl", "waste", "medical",
@@ -125,16 +127,18 @@ def run_sonnet_rationale(top_experts: list[dict], company: dict, growth_pod: lis
     """Generate rationales for matched experts and Growth Pod assignments."""
     client = anthropic.Anthropic()
 
-    comp = company.get("company", {})
+    # step1 emits explicit nulls for honest-unknowns; .get's default only covers
+    # a MISSING key, so coalesce the values themselves.
+    comp = company.get("company") or {}
     summary = {
-        "name": comp.get("name", ""),
-        "description": comp.get("description", ""),
-        "sector": comp.get("sector", ""),
-        "sub_sector": comp.get("sub_sector", ""),
-        "geography": comp.get("geography", {}),
-        "product": company.get("product", {}).get("description", ""),
-        "target_buyers": company.get("market", {}).get("target_buyers", []),
-        "data_gaps": company.get("data_gaps", [])[:5],
+        "name": comp.get("name") or "",
+        "description": comp.get("description") or "",
+        "sector": comp.get("sector") or "",
+        "sub_sector": comp.get("sub_sector") or "",
+        "geography": comp.get("geography") or {},
+        "product": (company.get("product") or {}).get("description") or "",
+        "target_buyers": (company.get("market") or {}).get("target_buyers") or [],
+        "data_gaps": (company.get("data_gaps") or [])[:5],
     }
 
     expert_summaries = []
@@ -244,7 +248,7 @@ def run_step5(slug: str) -> Path:
     with open(step1_path) as f:
         company = json.load(f)
 
-    comp = company.get("company", {})
+    comp = company.get("company") or {}
     print(f"={'='*59}")
     print(f"STEP 5: Expert Matching")
     print(f"Company: {comp.get('name')}")
@@ -260,7 +264,7 @@ def run_step5(slug: str) -> Path:
     result = run_sonnet_rationale(top, company, GROWTH_POD)
 
     output = {
-        "company": comp.get("name", ""),
+        "company": comp.get("name") or "",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": SONNET_MODEL,
         "total_experts_in_db": len(experts),

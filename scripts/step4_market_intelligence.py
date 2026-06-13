@@ -43,17 +43,19 @@ SKILL_ROOT = Path("/home/openclaw/playbook-skill")
 
 def run_market_web_research(client: anthropic.Anthropic, company: dict) -> str:
     """Use Sonnet with web search to do comprehensive market research."""
-    comp = company.get("company", {})
-    product = company.get("product", {})
-    market = company.get("market", {})
-    geo = comp.get("geography", {})
+    # step1 emits explicit nulls for honest-unknowns; .get's default only covers
+    # a MISSING key, so coalesce the values themselves.
+    comp = company.get("company") or {}
+    product = company.get("product") or {}
+    market = company.get("market") or {}
+    geo = comp.get("geography") or {}
 
-    hq = geo.get("hq", "Canada")
-    sector = comp.get("sector", "cleantech")
-    sub_sector = comp.get("sub_sector", "")
-    product_desc = product.get("description", comp.get("description", ""))
-    target_buyers = market.get("target_buyers", [])
-    company_name = comp.get("name", "")
+    hq = geo.get("hq") or "Canada"
+    sector = comp.get("sector") or "cleantech"
+    sub_sector = comp.get("sub_sector") or ""
+    product_desc = product.get("description") or comp.get("description") or ""
+    target_buyers = market.get("target_buyers") or []
+    company_name = comp.get("name") or ""
 
     search_prompt = f"""Do comprehensive market research for this company. Search the web thoroughly.
 
@@ -142,27 +144,29 @@ Output valid JSON only. No markdown fences."""
 
 def run_market_analysis(client: anthropic.Anthropic, company: dict, web_research: str) -> dict:
     """Structure all market research into the step4 JSON schema."""
-    comp = company.get("company", {})
-    product = company.get("product", {})
-    traction = company.get("traction", {})
-    market = company.get("market", {})
+    # step1 emits explicit nulls for honest-unknowns; .get's default only covers
+    # a MISSING key, so coalesce the values themselves.
+    comp = company.get("company") or {}
+    product = company.get("product") or {}
+    traction = company.get("traction") or {}
+    market = company.get("market") or {}
 
     company_summary = {
-        "name": comp.get("name", ""),
-        "description": comp.get("description", ""),
-        "sector": comp.get("sector", ""),
-        "sub_sector": comp.get("sub_sector", ""),
-        "stage": comp.get("stage", ""),
-        "trl": comp.get("trl", ""),
-        "geography": comp.get("geography", {}),
-        "product": product.get("description", ""),
-        "key_claims": [c.get("claim", "") for c in product.get("key_claims", [])[:5]],
-        "regulatory": {k: v.get("status", "") for k, v in product.get("regulatory_status", {}).items()},
-        "patents": [p.get("title", "") for p in product.get("ip", {}).get("patents", [])],
-        "target_buyers": market.get("target_buyers", []),
-        "website_logos": [l.get("name", "") for l in traction.get("website_logos", [])],
-        "recent_news": [n.get("headline", "") for n in company.get("signals", {}).get("recent_news", [])],
-        "data_gaps": company.get("data_gaps", [])[:5],
+        "name": comp.get("name") or "",
+        "description": comp.get("description") or "",
+        "sector": comp.get("sector") or "",
+        "sub_sector": comp.get("sub_sector") or "",
+        "stage": comp.get("stage") or "",
+        "trl": comp.get("trl") or "",
+        "geography": comp.get("geography") or {},
+        "product": product.get("description") or "",
+        "key_claims": [c.get("claim") or "" for c in (product.get("key_claims") or [])[:5]],
+        "regulatory": {k: (v or {}).get("status") or "" for k, v in (product.get("regulatory_status") or {}).items()},
+        "patents": [p.get("title") or "" for p in (product.get("ip") or {}).get("patents") or []],
+        "target_buyers": market.get("target_buyers") or [],
+        "website_logos": [l.get("name") or "" for l in traction.get("website_logos") or []],
+        "recent_news": [n.get("headline") or "" for n in (company.get("signals") or {}).get("recent_news") or []],
+        "data_gaps": (company.get("data_gaps") or [])[:5],
     }
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -266,7 +270,7 @@ def run_step4(slug: str) -> Path:
     with open(step1_path) as f:
         company = json.load(f)
 
-    comp = company.get("company", {})
+    comp = company.get("company") or {}
     print(f"=" * 60)
     print(f"STEP 4: Market Intelligence (Self-Contained)")
     print(f"Company: {comp.get('name', 'Unknown')}")
