@@ -18,6 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync, spawn } = require('child_process');
 const { URL } = require('url');
+const { verifyCdSession } = require('./cd-session-verify'); // CLI-2790
 
 // ---------------------------------------------------------------------------
 // Config
@@ -1808,13 +1809,38 @@ async function handleCreate(req, res) {
 // HTTP Server
 // ---------------------------------------------------------------------------
 const server = http.createServer(async (req, res) => {
+  // CLI-2790: parse + NORMALIZE the URL before the auth gate. The gate used to
+  // classify "public" routes off the RAW req.url, but routing below uses the
+  // normalized URL().pathname -- so `GET /health/../api/playbooks/_list` was
+  // treated as public (raw starts with /health/) yet dispatched to the
+  // protected list endpoint: an unauthenticated bypass (the CLI-1881/CLI-2772
+  // normalization-vs-classification class). Classify off the SAME normalized
+  // pathname the router uses. A URL that will not parse is not safely
+  // classifiable: fail closed with 400.
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+  } catch (_e) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'Bad request URL' }));
+  }
+  const _p = parsedUrl.pathname;
+
   // CLI-235 basic auth (shared realm ClimateDoor)
   // CLI-1240 v78d: when CD_TRUST_COOKIE_AUTH=1, accept the cd_session cookie
   // (set by radar /auth/session) instead of basic-auth credentials.
-  const _authPublic = req.url === '/health' || req.url === '/api/health' || (req.url && req.url.startsWith('/health/')) || (req.url && /^(?:\/playbooks)?\/share\/[A-Za-z0-9_-]{16,}(?:\?|$)/.test(req.url));
+  // CLI-2790: the cookie VALUE is verified against Supabase (a self-set
+  // cd_session cookie used to bypass basic auth on name presence alone --
+  // the CLI-1881/CLI-2772 class). A non-verifying cookie falls through to
+  // the basic auth prompt, so a Supabase outage never locks the editor.
+  const _authPublic = _p === '/health' || _p === '/api/health' || _p.startsWith('/health/') || /^(?:\/playbooks)?\/share\/[A-Za-z0-9_-]{16,}$/.test(_p);
   const _cookieRaw = req.headers && req.headers.cookie || '';
   const _hasCdSession = /(?:^|;\s*)cd_session=/.test(_cookieRaw);
-  if (!_authPublic && !(process.env.CD_TRUST_COOKIE_AUTH === '1' && _hasCdSession)) {
+  let _cookieAuthed = false;
+  if (!_authPublic && process.env.CD_TRUST_COOKIE_AUTH === '1' && _hasCdSession) {
+    _cookieAuthed = await verifyCdSession(_cookieRaw);
+  }
+  if (!_authPublic && !_cookieAuthed) {
     const _ah = req.headers.authorization || '';
     const _parts = _ah.split(' ');
     let _ok = false;
@@ -1840,8 +1866,6 @@ const server = http.createServer(async (req, res) => {
     });
     return res.end();
   }
-
-  const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
 
   // Special routes (not slug-based)
   if (parsedUrl.pathname === '/api/playbooks/_list' && req.method === 'GET') {
