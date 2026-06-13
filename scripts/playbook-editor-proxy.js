@@ -1696,7 +1696,7 @@ async function handleCreate(req, res) {
         : [path.join(scriptsDir, step.script), slug];
 
       await new Promise((resolve, reject) => {
-        const stepTimeout = 900000; // 15 minutes per step
+        const stepTimeout = 1800000; // CLI-2785: 30 min per step -- measured: the 8-call step3 + 5-call step4 exceed 15 min on subscription latency (the $0 cc-dispatch transport); call THINNING is the durable fix (follow-up)
         const proc = spawn('python3', args, {
           cwd: SKILL_ROOT,
           env: { ...process.env, ANTHROPIC_API_KEY, APOLLO_API_KEY: process.env.APOLLO_API_KEY || '' },
