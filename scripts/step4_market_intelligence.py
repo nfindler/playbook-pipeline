@@ -292,7 +292,7 @@ def run_step4(slug: str) -> Path:
         print(f"  [WARN] Market analysis had errors, saving partial result")
 
     output = {
-        "company": comp.get("name", ""),
+        "company": comp.get("name") or "",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": SONNET_MODEL,
         **result,

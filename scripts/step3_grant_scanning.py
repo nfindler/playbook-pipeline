@@ -686,12 +686,12 @@ def run_eligibility_analysis(client: anthropic.Anthropic, company: dict,
         "trl": comp.get("trl") or "",
         "geography": comp.get("geography") or {},
         "product": product.get("description") or "",
-        "key_claims": [c.get("claim", "") for c in product.get("key_claims", [])[:5]],
-        "regulatory": {k: v.get("status", "") for k, v in product.get("regulatory_status", {}).items()},
-        "patents": [p.get("title", "") for p in product.get("ip", {}).get("patents", [])],
-        "target_buyers": company.get("market", {}).get("target_buyers", []),
-        "funding_history": company.get("funding", {}),
-        "employee_count": company.get("team", {}).get("employee_count"),
+        "key_claims": [c.get("claim") or "" for c in (product.get("key_claims") or [])[:5]],
+        "regulatory": {k: (v or {}).get("status") or "" for k, v in (product.get("regulatory_status") or {}).items()},
+        "patents": [p.get("title") or "" for p in (product.get("ip") or {}).get("patents") or []],
+        "target_buyers": (company.get("market") or {}).get("target_buyers") or [],
+        "funding_history": company.get("funding") or {},
+        "employee_count": (company.get("team") or {}).get("employee_count"),
     }
 
     notion_section = ""
@@ -767,17 +767,17 @@ Output a JSON array. Be honest about gaps."""
 
 def run_grants_as_bd_analysis(client: anthropic.Anthropic, company: dict) -> list[dict]:
     """Analyze grants-as-BD-tool: grants the company's CUSTOMERS can get."""
-    comp = company.get("company", {})
-    product = company.get("product", {})
-    market = company.get("market", {})
-    geo = comp.get("geography", {})
+    comp = company.get("company") or {}
+    product = company.get("product") or {}
+    market = company.get("market") or {}
+    geo = comp.get("geography") or {}
 
     search_prompt = f"""GRANTS-AS-BD-TOOL ANALYSIS
 
-Company: {comp.get('name', '')}
-Description: {comp.get('description', '')}
-Product: {product.get('description', '')}
-Target buyers: {json.dumps(market.get('target_buyers', []))}
+Company: {comp.get('name') or ''}
+Description: {comp.get('description') or ''}
+Product: {product.get('description') or ''}
+Target buyers: {json.dumps(market.get('target_buyers') or [])}
 Geography: {json.dumps(geo)}
 
 The question is: "Can the company's END CUSTOMERS get grants that pay for this company's products/services?"
@@ -1029,12 +1029,12 @@ def run_step3(slug: str) -> Path:
 
     # Phase 5: Add web-discovered grants to Notion
     print(f"\n[Phase 5] Adding web-discovered grants to Notion...")
-    added_count = add_web_grants_to_notion(grants_analyzed, comp.get("name", slug))
+    added_count = add_web_grants_to_notion(grants_analyzed, comp.get("name") or slug)
     print(f"  Added {added_count} new grants to Notion DB")
 
     # Phase 6: Assemble output
     output = {
-        "company": comp.get("name", ""),
+        "company": comp.get("name") or "",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": SONNET_MODEL,
         "notion_db_id": NOTION_GRANT_DB,

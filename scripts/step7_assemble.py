@@ -143,7 +143,8 @@ def build_hero_tags(data):
         tags.append(f'<span class="htg htg-g" data-editable>{esc(geo)}</span>')
     trl = comp.get("trl")
     if trl:
-        tags.append(f'<span class="htg htg-g" data-editable>TRL {trl}</span>')
+        # trl is LLM-extracted web content; esc() like every sibling tag above.
+        tags.append(f'<span class="htg htg-g" data-editable>TRL {esc(str(trl))}</span>')
     return " ".join(tags)
 
 
@@ -329,7 +330,7 @@ INTAKE_QUESTIONS = [
 
 def build_overview_tab(data):
     """Build overview tab with market-driven 'Opportunity We See' hero, acceleration cards, capabilities."""
-    s1 = data.get("s1", {})
+    s1 = data.get("s1") or {}
     s4 = data.get("s4", {})
     s6 = data.get("s6", {})
     comp = s1.get("company") or {}
@@ -1669,7 +1670,7 @@ def assemble(slug: str) -> Path:
     s2_stats = data.get("s2", {}).get("pipeline_stats", {})
 
     # Split company name for hero styling
-    name = comp.get("name", slug.replace("-", " ").title())
+    name = comp.get("name") or slug.replace("-", " ").title()
     name_parts = name.rsplit(" ", 1)
     first = name_parts[0] if len(name_parts) > 1 else name
     last = name_parts[1] if len(name_parts) > 1 else ""

@@ -772,13 +772,13 @@ def run_step2(slug: str) -> Path:
     with open(step1_path) as f:
         company = json.load(f)
 
-    comp = company.get("company", {})
+    comp = company.get("company") or {}
     print(f"=" * 60)
     print(f"STEP 2: Multi-Pass Investor Matching")
-    print(f"Company: {comp.get('name', 'Unknown')}")
-    print(f"Sector:  {comp.get('sector', 'Unknown')}")
-    print(f"Stage:   {comp.get('stage', 'Unknown')}")
-    print(f"HQ:      {comp.get('geography', {}).get('hq', 'Unknown')}")
+    print(f"Company: {comp.get('name') or 'Unknown'}")
+    print(f"Sector:  {comp.get('sector') or 'Unknown'}")
+    print(f"Stage:   {comp.get('stage') or 'Unknown'}")
+    print(f"HQ:      {(comp.get('geography') or {}).get('hq') or 'Unknown'}")
     print(f"DB:      {INVESTOR_DB} (2,645 records)")
     print(f"Output:  {output_path}")
     print(f"=" * 60)
@@ -893,7 +893,7 @@ def run_step2(slug: str) -> Path:
 
     # --- Phase 6: Build output JSON ---
     output = {
-        "company": comp.get("name", ""),
+        "company": comp.get("name") or "",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": SONNET_MODEL,
         "pipeline_stats": {

@@ -68,7 +68,7 @@ def match_experts_to_company(experts: list[dict], company: dict) -> list[dict]:
     sector = ((comp.get("sector") or "") + " " + (comp.get("sub_sector") or "")).lower()
     geo = ((comp.get("geography") or {}).get("hq") or "").lower()
     product = ((company.get("product") or {}).get("description") or "").lower()
-    buyers = " ".join((company.get("market") or {}).get("target_buyers") or []).lower()
+    buyers = " ".join(b or "" for b in (company.get("market") or {}).get("target_buyers") or []).lower()
 
     # Keywords to match
     sector_kw = ["circular", "textile", "fashion", "sustainable", "recycl", "waste", "medical",
