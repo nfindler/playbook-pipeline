@@ -129,7 +129,8 @@ def map_sector_to_categories(sector: str, sub_sector: str = "") -> list[str]:
     """Map a company's sector (and sub_sector) to Notion Categories values."""
     categories = set()
 
-    for text in [sector.lower(), sub_sector.lower()]:
+    # sector/sub_sector arrive as explicit nulls from step1 honest-unknowns.
+    for text in [(sector or "").lower(), (sub_sector or "").lower()]:
         if not text:
             continue
         # Direct match
@@ -151,7 +152,7 @@ def map_sector_to_categories(sector: str, sub_sector: str = "") -> list[str]:
 def map_geography_to_regions(geography: dict) -> list[str]:
     """Map a company's geography to Notion Region values."""
     regions = set()
-    hq = geography.get("hq", "")
+    hq = (geography or {}).get("hq") or ""
 
     # Always include Canada
     regions.add("Canada")
@@ -580,22 +581,24 @@ def _query_notion_grants_unfiltered() -> list[dict]:
 
 def search_grants_web(client: anthropic.Anthropic, company: dict) -> str:
     """Use Sonnet with web search to find grant programs matching the company."""
-    comp = company.get("company", {})
-    product = company.get("product", {})
-    geo = comp.get("geography", {})
+    # step1 emits explicit nulls for honest-unknowns; .get's default only covers
+    # a MISSING key, so coalesce the values themselves.
+    comp = company.get("company") or {}
+    product = company.get("product") or {}
+    geo = comp.get("geography") or {}
 
-    hq = geo.get("hq", "Canada")
+    hq = geo.get("hq") or "Canada"
     province = ""
     if "," in hq:
         parts = [p.strip() for p in hq.split(",")]
         if len(parts) >= 2:
             province = parts[-2] if len(parts) >= 3 else parts[0]
 
-    sector = comp.get("sector", "cleantech")
-    sub_sector = comp.get("sub_sector", "")
-    stage = comp.get("stage", "")
-    trl = comp.get("trl", "")
-    product_desc = product.get("description", comp.get("description", ""))
+    sector = comp.get("sector") or "cleantech"
+    sub_sector = comp.get("sub_sector") or ""
+    stage = comp.get("stage") or ""
+    trl = comp.get("trl") or ""
+    product_desc = product.get("description") or comp.get("description") or ""
 
     search_prompt = f"""Search the web for Canadian grant programs that would be relevant for this company:
 
@@ -671,24 +674,24 @@ CRITICAL RULES:
 def run_eligibility_analysis(client: anthropic.Anthropic, company: dict,
                              notion_grants: list[dict], web_research: str) -> list[dict]:
     """Score all grants against the company profile."""
-    comp = company.get("company", {})
-    product = company.get("product", {})
+    comp = company.get("company") or {}
+    product = company.get("product") or {}
 
     company_summary = {
-        "name": comp.get("name", ""),
-        "description": comp.get("description", ""),
-        "sector": comp.get("sector", ""),
-        "sub_sector": comp.get("sub_sector", ""),
-        "stage": comp.get("stage", ""),
-        "trl": comp.get("trl", ""),
-        "geography": comp.get("geography", {}),
-        "product": product.get("description", ""),
-        "key_claims": [c.get("claim", "") for c in product.get("key_claims", [])[:5]],
-        "regulatory": {k: v.get("status", "") for k, v in product.get("regulatory_status", {}).items()},
-        "patents": [p.get("title", "") for p in product.get("ip", {}).get("patents", [])],
-        "target_buyers": company.get("market", {}).get("target_buyers", []),
-        "funding_history": company.get("funding", {}),
-        "employee_count": company.get("team", {}).get("employee_count"),
+        "name": comp.get("name") or "",
+        "description": comp.get("description") or "",
+        "sector": comp.get("sector") or "",
+        "sub_sector": comp.get("sub_sector") or "",
+        "stage": comp.get("stage") or "",
+        "trl": comp.get("trl") or "",
+        "geography": comp.get("geography") or {},
+        "product": product.get("description") or "",
+        "key_claims": [c.get("claim") or "" for c in (product.get("key_claims") or [])[:5]],
+        "regulatory": {k: (v or {}).get("status") or "" for k, v in (product.get("regulatory_status") or {}).items()},
+        "patents": [p.get("title") or "" for p in (product.get("ip") or {}).get("patents") or []],
+        "target_buyers": (company.get("market") or {}).get("target_buyers") or [],
+        "funding_history": company.get("funding") or {},
+        "employee_count": (company.get("team") or {}).get("employee_count"),
     }
 
     notion_section = ""
@@ -764,17 +767,17 @@ Output a JSON array. Be honest about gaps."""
 
 def run_grants_as_bd_analysis(client: anthropic.Anthropic, company: dict) -> list[dict]:
     """Analyze grants-as-BD-tool: grants the company's CUSTOMERS can get."""
-    comp = company.get("company", {})
-    product = company.get("product", {})
-    market = company.get("market", {})
-    geo = comp.get("geography", {})
+    comp = company.get("company") or {}
+    product = company.get("product") or {}
+    market = company.get("market") or {}
+    geo = comp.get("geography") or {}
 
     search_prompt = f"""GRANTS-AS-BD-TOOL ANALYSIS
 
-Company: {comp.get('name', '')}
-Description: {comp.get('description', '')}
-Product: {product.get('description', '')}
-Target buyers: {json.dumps(market.get('target_buyers', []))}
+Company: {comp.get('name') or ''}
+Description: {comp.get('description') or ''}
+Product: {product.get('description') or ''}
+Target buyers: {json.dumps(market.get('target_buyers') or [])}
 Geography: {json.dumps(geo)}
 
 The question is: "Can the company's END CUSTOMERS get grants that pay for this company's products/services?"
@@ -989,8 +992,8 @@ def run_step3(slug: str) -> Path:
     with open(step1_path) as f:
         company = json.load(f)
 
-    comp = company.get("company", {})
-    geo = comp.get("geography", {})
+    comp = company.get("company") or {}
+    geo = comp.get("geography") or {}
     print(f"=" * 60)
     print(f"STEP 3: Grant Scanning (Self-Contained)")
     print(f"Company: {comp.get('name', 'Unknown')}")
@@ -1005,8 +1008,8 @@ def run_step3(slug: str) -> Path:
     # Phase 1: Query Notion with proper filtering
     print(f"\n[Phase 1] Querying Notion grant database...")
     notion_grants = query_notion_grants(
-        sector=comp.get("sector", ""),
-        sub_sector=comp.get("sub_sector", ""),
+        sector=comp.get("sector") or "",
+        sub_sector=comp.get("sub_sector") or "",
         geography=geo,
     )
 
@@ -1026,12 +1029,12 @@ def run_step3(slug: str) -> Path:
 
     # Phase 5: Add web-discovered grants to Notion
     print(f"\n[Phase 5] Adding web-discovered grants to Notion...")
-    added_count = add_web_grants_to_notion(grants_analyzed, comp.get("name", slug))
+    added_count = add_web_grants_to_notion(grants_analyzed, comp.get("name") or slug)
     print(f"  Added {added_count} new grants to Notion DB")
 
     # Phase 6: Assemble output
     output = {
-        "company": comp.get("name", ""),
+        "company": comp.get("name") or "",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": SONNET_MODEL,
         "notion_db_id": NOTION_GRANT_DB,

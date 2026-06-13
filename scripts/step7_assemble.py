@@ -130,7 +130,7 @@ def build_alerts(data):
 
 
 def build_hero_tags(data):
-    comp = data.get("s1", {}).get("company", {})
+    comp = (data.get("s1") or {}).get("company") or {}
     tags = []
     if comp.get("sector"):
         tags.append(f'<span class="htg htg-s" data-editable>{esc(comp["sector"])}</span>')
@@ -138,12 +138,13 @@ def build_hero_tags(data):
         tags.append(f'<span class="htg htg-s" data-editable>{esc(comp["sub_sector"])}</span>')
     if comp.get("stage"):
         tags.append(f'<span class="htg htg-c" data-editable>{esc(comp["stage"])}</span>')
-    geo = comp.get("geography", {}).get("hq", "")
+    geo = (comp.get("geography") or {}).get("hq") or ""
     if geo:
         tags.append(f'<span class="htg htg-g" data-editable>{esc(geo)}</span>')
     trl = comp.get("trl")
     if trl:
-        tags.append(f'<span class="htg htg-g" data-editable>TRL {trl}</span>')
+        # trl is LLM-extracted web content; esc() like every sibling tag above.
+        tags.append(f'<span class="htg htg-g" data-editable>TRL {esc(str(trl))}</span>')
     return " ".join(tags)
 
 
@@ -329,10 +330,10 @@ INTAKE_QUESTIONS = [
 
 def build_overview_tab(data):
     """Build overview tab with market-driven 'Opportunity We See' hero, acceleration cards, capabilities."""
-    s1 = data.get("s1", {})
+    s1 = data.get("s1") or {}
     s4 = data.get("s4", {})
     s6 = data.get("s6", {})
-    comp = s1.get("company", {})
+    comp = s1.get("company") or {}
 
     # ── Build headline from market data (not company claims) ──
     market = s4.get("market_sizing", {})
@@ -404,7 +405,7 @@ def build_overview_tab(data):
             if tam_short:
                 headline = f"Market opportunity of {tam_short}"
             else:
-                headline = comp.get("description", "Significant market opportunity identified.")
+                headline = comp.get("description") or "Significant market opportunity identified."
 
         # Strip source citations (anything after em dash, or "— Source, Date" patterns)
         for sep in [" \u2014 ", " -- ", " \u2013 "]:
@@ -447,7 +448,7 @@ def build_overview_tab(data):
             if len(subheadline) > 200:
                 subheadline = subheadline[:197] + "..."
         else:
-            subheadline = comp.get("description", "")[:200]
+            subheadline = (comp.get("description") or "")[:200]
 
     # Acceleration cards from creative opportunities
     creative_opps = s6.get("creative_opportunities", [])
@@ -582,7 +583,7 @@ def build_overview_tab(data):
 def build_questions_tab(data):
     """Build Questions tab with 14 standardized intake questions + pre-filled answers from synthesis."""
     s6 = data.get("s6", {})
-    comp = data.get("s1", {}).get("company", {})
+    comp = (data.get("s1") or {}).get("company") or {}
     company_name = comp.get("name", "")
 
     # Get pre-filled answers from synthesis (keyed by question number 1-11)
@@ -1039,7 +1040,7 @@ def build_experts_tab(data):
     """Build expert cards + Growth Pod using real CD team data."""
     s5 = data.get("s5", {})
     experts = s5.get("expert_matches", [])
-    comp = data.get("s1", {}).get("company", {})
+    comp = (data.get("s1") or {}).get("company") or {}
     company_name = comp.get("name", "")
 
     parts = []
@@ -1664,12 +1665,12 @@ def assemble(slug: str) -> Path:
     with open(TEMPLATE_PATH) as f:
         tpl = f.read()
 
-    comp = data.get("s1", {}).get("company", {})
+    comp = (data.get("s1") or {}).get("company") or {}
     c = counts(data)
     s2_stats = data.get("s2", {}).get("pipeline_stats", {})
 
     # Split company name for hero styling
-    name = comp.get("name", slug.replace("-", " ").title())
+    name = comp.get("name") or slug.replace("-", " ").title()
     name_parts = name.rsplit(" ", 1)
     first = name_parts[0] if len(name_parts) > 1 else name
     last = name_parts[1] if len(name_parts) > 1 else ""
