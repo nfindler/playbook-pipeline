@@ -21,7 +21,7 @@ for env_file in ["/home/openclaw/radar-platform/.env", "/home/openclaw/.openclaw
 import json, sys, re, time
 from datetime import datetime, timezone
 from pathlib import Path
-import anthropic
+import cc_anthropic as anthropic  # CLI-2785: the $0 cc-dispatch transport (the metered SDK stays dark behind serving_mode)
 
 # CC-dispatch pivot (2026-05-23): when CD_USE_CC_DISPATCH=1 and the
 # transport is wired, this step routes through CC instead of the

@@ -32,7 +32,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
+import cc_anthropic as anthropic  # CLI-2785: the $0 cc-dispatch transport (the metered SDK stays dark behind serving_mode)
 import requests as req_lib
 
 # ---------------------------------------------------------------------------

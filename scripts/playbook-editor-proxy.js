@@ -1730,6 +1730,15 @@ async function handleCreate(req, res) {
       // Step 1 is a hard requirement — can't build anything without company data
       if (step.num === 1) {
         hardFail = true;
+        // CLI-2785: a hard fail must leave a DURABLE receipt, not just a transient SSE event
+        // into one browser tab (the CLI-2777 credits incident died silently: empty dir, no
+        // trace an operator could find).
+        try {
+          fs.writeFileSync(path.join(dataDir, 'generation-failed.json'), JSON.stringify({
+            slug, company_name, failed_step: step.num, error: String(err.message || err).slice(0, 600),
+            at: new Date().toISOString(),
+          }, null, 2));
+        } catch (_e) { /* best-effort */ }
         sendEvent('error', { step: step.num, message: err.message });
         break;
       }
@@ -1776,9 +1785,17 @@ async function handleCreate(req, res) {
       deployed = true;
     }
 
-    if (deployed || skippedSteps.length < 6) {
-      sendEvent('complete', { slug, url: `/playbooks/${slug}/`, skipped: skippedSteps });
-      log(`[CREATE] Pipeline complete for ${slug} (skipped steps: ${skippedSteps.join(', ') || 'none'})`);
+    // CLI-2785 (the CLI-2777 regression ask): COMPLETE is only reported when the published
+    // slug is actually visible to the live list (handleList scans DEPLOY_ROOT for
+    // <slug>/index.html). Generation completes -> index entry exists, same step.
+    const onIndex = deployed && fs.existsSync(path.join(DEPLOY_ROOT, slug, 'index.html'));
+    if (deployed && !onIndex) {
+      log(`[CREATE] INDEX-VERIFY FAILED for ${slug}: deployed but not visible to the list scan`);
+    }
+    if (onIndex || (!deployed && skippedSteps.length < 6)) {
+      sendEvent('complete', { slug, url: `/playbooks/${slug}/`, skipped: skippedSteps, on_index: onIndex });
+      log(`[CREATE] Pipeline complete for ${slug} (on_index=${onIndex}; skipped steps: ${skippedSteps.join(', ') || 'none'})`);
+      try { fs.rmSync(path.join(dataDir, 'generation-failed.json'), { force: true }); } catch (_e) { /* a prior failure receipt clears on success */ }
     } else {
       sendEvent('error', { step: 0, message: 'Too many steps failed. Playbook could not be assembled.' });
     }

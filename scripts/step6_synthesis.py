@@ -21,7 +21,7 @@ for env_file in ["/home/openclaw/radar-platform/.env", "/home/openclaw/.openclaw
 import json, sys, re, time
 from datetime import datetime, timezone
 from pathlib import Path
-import anthropic
+import cc_anthropic as anthropic  # CLI-2785: the $0 cc-dispatch transport (the metered SDK stays dark behind serving_mode)
 
 OPUS_MODEL = "claude-opus-4-20250514"
 SKILL_ROOT = Path("/home/openclaw/playbook-skill")
