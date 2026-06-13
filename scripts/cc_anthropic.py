@@ -26,7 +26,36 @@ CLAUDE_BIN = os.environ.get("CC_DISPATCH_CLAUDE_BIN") or os.path.expanduser("~/.
 if not os.path.exists(CLAUDE_BIN):
     CLAUDE_BIN = "claude"
 # The subscription credentials dir (the CLI-2733 prior: pinned => $0).
-CONFIG_DIR = os.environ.get("CC_DISPATCH_CONFIG_DIR", "/home/openclaw/.claude-climatedoor")
+_SHARED_CONFIG_DIR = "/home/openclaw/.claude-climatedoor"
+
+
+def _config_dir():
+    """review fix (PR #3): the proxy runs as ROOT; a root-spawned claude rewrites
+    .claude.json/.credentials.json inside the config dir, and root-owned files in the SHARED
+    openclaw subscription dir would break every other $0 flow on the box. Root gets its own
+    clone (refreshed when the shared creds are newer); openclaw uses the shared dir."""
+    explicit = os.environ.get("CC_DISPATCH_CONFIG_DIR")
+    if explicit:
+        return explicit
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        clone = "/root/.claude-climatedoor-cc2785"
+        try:
+            src_cred = os.path.join(_SHARED_CONFIG_DIR, ".credentials.json")
+            dst_cred = os.path.join(clone, ".credentials.json")
+            if not os.path.isdir(clone) or (
+                os.path.exists(src_cred)
+                and (not os.path.exists(dst_cred) or os.path.getmtime(src_cred) > os.path.getmtime(dst_cred))
+            ):
+                import shutil
+
+                shutil.copytree(_SHARED_CONFIG_DIR, clone, dirs_exist_ok=True)
+            return clone
+        except Exception:
+            return _SHARED_CONFIG_DIR  # degraded but functional; the hazard window is the refresh write
+    return _SHARED_CONFIG_DIR
+
+
+CONFIG_DIR = _config_dir()
 OVERLAY_FILE = os.environ.get(
     "CC_STATE_OVERLAY", "/home/openclaw/cc-state/cc-orchestrator.config.overlay.json"
 )
@@ -132,11 +161,17 @@ class _Messages(object):
             "--setting-sources", "project",
             "--disallowedTools", *disallowed,
         ]
+        if wants_web:
+            # review fix (PR #3): headless -p DENIES WebSearch unless explicitly allowed --
+            # without this the 4 web-research call sites silently degrade to training-data
+            # answers with fabricated-looking source URLs (proven via permission_denials).
+            args += ["--allowedTools", "WebSearch"]
         if system:
             args += ["--system-prompt", str(system)[:30000]]
         env = dict(os.environ)
         env.pop("ANTHROPIC_API_KEY", None)  # $0 by construction: the child can never meter
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        env.pop("ANTHROPIC_BASE_URL", None)  # parity with the canonical JS bridge
         env["CLAUDE_CONFIG_DIR"] = CONFIG_DIR
         t0 = time.time()
         proc = subprocess.run(
@@ -148,10 +183,14 @@ class _Messages(object):
         raw = proc.stdout.decode("utf-8", "replace")
         try:
             payload = json.loads(raw)
+            if payload.get("is_error") or (payload.get("subtype") and payload.get("subtype") != "success"):
+                # review fix (PR #3): an error envelope returned as CONTENT would re-open the
+                # CLI-2777 silent-failure class on the subscription side. Fail loudly.
+                raise RuntimeError("cc_anthropic: claude -p error envelope: %s" % str(payload.get("result") or payload.get("subtype"))[:300])
             text = payload.get("result") or ""
             usage = payload.get("usage") or {}
             resp_usage = _Usage(int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0))
-        except Exception:
+        except json.JSONDecodeError:
             # -p json should always be json; degrade to raw text rather than lose a real answer
             text, resp_usage = raw, _Usage()
         if not str(text).strip():
