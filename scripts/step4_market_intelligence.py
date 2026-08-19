@@ -127,7 +127,7 @@ You are producing structured market intelligence for a company playbook.
 
 CRITICAL SOURCING RULES:
 1. Every market sizing number MUST have: a cited source with URL, a calculation with shown methodology, or an explicit "unverified" flag.
-2. Named organizations, not categories. "Dentalcorp (500+ clinics)" not "large DSOs".
+2. Named organizations, not categories. Name the actual buyer with its actual scale, e.g. "<Operator name> (<N> sites)" rather than "large operators" - but the name and the number must come from THIS company's research, never from this instruction. (CLI-4002: the previous example here named a specific past client's buyer, which is a live prompt asking the model to reach for that one company by default.)
 3. Decision maker titles from actual org charts or job postings, not generic guesses.
 4. Conference dates must be from event websites. Do not include events that have already happened (today is {today}).
 5. Competitors must actually exist - provide website URLs.

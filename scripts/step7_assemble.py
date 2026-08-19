@@ -1050,14 +1050,30 @@ def build_experts_tab(data):
     parts.append('<div class="sh">Growth Pod</div>')
     parts.append(f'<div class="sd">Your dedicated ClimateDoor team for the {esc(company_name)} engagement.</div>')
 
-    # Select 5 team members relevant to this company
-    # Nick always leads, then pick based on company needs
+    # The five CD roles. These rationales describe what each person DOES on any engagement; they must never
+    # name a partner, a funding program, a community or a count, because this block is rendered identically
+    # onto every client playbook.
+    #
+    # CLI-4002 item (3). Until 2026-08-19 these five strings hardcoded four claims that were true of exactly
+    # one past engagement (Frett Design: dental-mask maker, sells into 123Dentist and Dentalcorp, Quebec
+    # company chasing Investissement Quebec, "17 qualified investors identified"). Because the block is
+    # rendered for every client, 31 other clients' playbooks asserted those four facts as their own. Measured
+    # on the live estate: 36 pages, 32 client slugs, byte-identical. A California cultured-meat company was
+    # told to "Execute the Dentalcorp and 123Dentist procurement strategies", and a company with 2 real ACT
+    # NOW investor matches was told to work "the 17 ACT NOW matches" (real counts ranged 2 to 22, so the
+    # frozen 17 was wrong on 30 of 36 pages).
+    #
+    # THE RULE, so this cannot recur: a string in this list is rendered for a client this function knows
+    # nothing about beyond its name. Anything client-specific therefore has to be DERIVED from `data`, not
+    # written here. If a rationale needs a real number or a real partner, read it off the playbook; if it is
+    # not available, say less rather than inventing it. The already-rendered pages were blanked by
+    # playbook-platform scripts/cli-4002-blank-boilerplate-bleed.js, whose replacement text these match.
     pod_assignments = [
-        {"key": "nick", "rationale": f"Lead all investor conversations for {esc(company_name)}. Activate Hot and Warm investor relationships from the 17 ACT NOW matches."},
-        {"key": "sophie", "rationale": f"Build non-dilutive funding roadmap. Lead IRAP, SR&ED, and Investissement Quebec applications for {esc(company_name)}."},
-        {"key": "ash", "rationale": f"Drive DSO and healthcare buyer outreach. Execute the Dentalcorp and 123Dentist procurement strategies."},
+        {"key": "nick", "rationale": f"Lead all investor conversations for {esc(company_name)}. Activate the Hot and Warm investor relationships surfaced in this playbook."},
+        {"key": "sophie", "rationale": f"Build non-dilutive funding roadmap. Lead the grant and tax-credit applications that fit {esc(company_name)}."},
+        {"key": "ash", "rationale": f"Drive buyer outreach and execute the procurement strategy for the priority accounts in this playbook."},
         {"key": "sam", "rationale": f"Coordinate client delivery and pipeline tracking. Manage the multi-stream playbook execution."},
-        {"key": "tiff", "rationale": f"Lead Mi'gmaq community engagement in Gaspesie. Ensure community-first approach to Indigenous partnership opportunities."},
+        {"key": "tiff", "rationale": f"Lead community and Indigenous partnership engagement. Ensure a community-first approach to partnership opportunities."},
     ]
 
     parts.append('<div class="pod-s"><div class="pod-g">')
