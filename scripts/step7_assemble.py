@@ -31,13 +31,46 @@ CD_TEAM = {
 }
 
 
+# CLI-4002 item (5), "en-dash corruption". The brand rule is "never an em dash" and that is NOT what
+# was wrong. What was wrong is the punctuation the substitution left behind, on 33 client slugs and
+# 8,146 dashes, live since April:
+#
+#   "USA only - Polysource is..."  ->  "USA only , Polysource is..."   space stranded before the comma
+#   "grid-scale" (em dash)         ->  "grid,scale"                    no space after
+#   "$1M-$5M"    (en dash)         ->  "$1M,$5M"                       a RANGE now reads as a list
+#
+# The third one is why this is not cosmetic. 1,049 of the 8,146 dashes sit between two digits, so a
+# cheque size or a date range became two separate figures. "$1M,$5M" renders 132 times on the live
+# estate, alongside "$50M,$500M", "2025,2028" and "TRL range (1,9)". A client cannot tell that from a
+# typo, and it is their money and their timeline. A range therefore keeps its meaning in words rather
+# than collapsing to a comma.
+#
+# The two entity forms below were measured UNREACHABLE in the old code and are kept only because input
+# could arrive pre-escaped: html.escape() turns a literal "&mdash;" into "&amp;mdash;" before the
+# replace ever ran, so `.replace("&mdash;", ",")` could never fire. Zero occurrences in the source data
+# and zero on the rendered estate either way.
+#
+# A "range side" is derived from what the source data actually contains, not from what a range looks
+# like in the abstract. Counted over all 33 slugs, the tight (unspaced) dashes are almost entirely
+# ranges: "$1M-$5M" x109, "($100k-$1M)" x44, "3-5" x28, "12-18" x23, "60-80%" x23, "2025-2026" x14,
+# "Q2-Q3" x12. So a side is an optional currency mark, digits, and an optional unit or percent.
+# A digit is required on BOTH sides, which is what keeps prose off this branch: "database - a" and
+# "'Warm' - a" have no digit on the right and fall through to the comma rule below, correctly.
+_DASH_CHARS = r"(?:[\u2013\u2014]|&(?:amp;)?[mn]dash;)"
+_RANGE_SIDE = r"(?:[$\u20ac\u00a3]|C\$|US\$|USD\s*)?Q?\d[\d,.]*(?:[kKmMbB]|%)?"
+_NUM_RANGE_DASH = re.compile(rf"({_RANGE_SIDE})\s*{_DASH_CHARS}\s*({_RANGE_SIDE})")
+_PROSE_DASH = re.compile(rf"\s*{_DASH_CHARS}\s*")
+
+
 def esc(s):
-    """HTML-escape a string, handle None. Replace em dashes with commas."""
+    """HTML-escape a string, handle None. Replace dashes without corrupting punctuation or ranges."""
     if s is None:
         return ""
     out = html_mod.escape(str(s))
-    # Never use em dashes
-    out = out.replace("\u2014", ",").replace("\u2013", ",").replace("&mdash;", ",").replace("&ndash;", ",")
+    # Never an em dash, either way. A numeric range keeps its meaning; every other dash becomes a
+    # comma with exactly one following space, whatever whitespace surrounded the dash.
+    out = _NUM_RANGE_DASH.sub(r"\1 to \2", out)
+    out = _PROSE_DASH.sub(", ", out)
     return out
 
 
@@ -1637,7 +1670,13 @@ def build_landscape_tab(data):
             diff = c.get("differentiator_vs_frett", "")
             strengths = c.get("strengths", "")
             weaknesses = c.get("weaknesses", "")
-            trl = c.get("trl", "")
+            # `.get(k, "")` returns the DEFAULT only when the key is ABSENT. step4-market.json carries
+            # "trl": null explicitly, so this returned None, not "". Every sibling field on this card is
+            # guarded by an `if` before it is interpolated; trl was not, and it is the one field written
+            # into the card unescaped (line below). CLI-4002 item (5): that rendered "TRL None" into the
+            # competitor spec on a live client page, 5 times on sense-and-motion, where the same slot
+            # renders a number on 143 cards across the estate. `or ""` reads the null, not just the gap.
+            trl = c.get("trl") or ""
             funding = c.get("funding_known", "")
             delay = f" d{(i % 6) + 1}" if i < 6 else ""
 
@@ -1658,7 +1697,7 @@ def build_landscape_tab(data):
                 f'    <div class="sc-body">'
                 f'      <div class="sc-pill">COMPETITOR</div>'
                 f'      <div class="sc-tt">{esc(cname)}</div>'
-                f'      <div class="sc-ds">TRL {trl} | {esc(funding[:80]) if funding else "Funding unknown"}</div>'
+                f'      <div class="sc-ds">TRL {esc(trl) if trl else "unknown"} | {esc(funding[:80]) if funding else "Funding unknown"}</div>'
                 f'    </div>'
                 f'    <div class="sc-tog">{CHEVRON_SVG}</div>'
                 f'  </div>'

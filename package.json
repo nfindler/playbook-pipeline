@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "jest",
+    "test": "jest && python3 tests/test_step7_esc.py",
     "test:watch": "jest --watch"
   },
   "keywords": [],
