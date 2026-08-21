@@ -86,8 +86,65 @@ def check_trl_none():
     return out
 
 
+def check_shape_bugs():
+    """CLI-4002 item (5): three producer slots rendered a Python VALUE instead of its content.
+
+    All three are driven through the real builders. Each one is a shape mismatch between what the
+    step JSON actually holds and what the renderer assumed, and each was invisible to the estate
+    detector because the detector looked for the wrong surface form.
+    """
+    out = []
+
+    # 1. grant_pathways is a semicolon-joined STRING on 16 slugs. `for gp in <str>` walks CHARACTERS,
+    #    so the card rendered "P<br>r<br>a<br>i..." -- a ~500-character column of single letters.
+    signals = {"s4": {"indigenous_opportunities": [{
+        "community_or_org": "Example Nation", "region": "Prairies", "fit_score": 70,
+        "grant_pathways": "PrairiesCan fund; CEC NAPECA grant program",
+    }]}, "s6": {}}
+    html = step7.build_indigenous_tab(signals)
+    if "P<br>r<br>a" in html or ">P<br>" in html:
+        out.append("build_indigenous_tab still iterates a grant_pathways STRING one character at a time")
+    if "PrairiesCan fund; CEC NAPECA grant program" not in html:
+        out.append("build_indigenous_tab lost the grant_pathways text entirely")
+    # Anti-vacuity: a real LIST must still render each pathway on its own line.
+    signals["s4"]["indigenous_opportunities"][0]["grant_pathways"] = ["Alpha fund", "Beta program"]
+    html_list = step7.build_indigenous_tab(signals)
+    if "Alpha fund<br>" not in html_list or "Beta program<br>" not in html_list:
+        out.append("build_indigenous_tab broke the normal LIST case while fixing the string case")
+
+    # 2. primary_risk is a DICT on 14 of 42 slugs; esc(dict) rendered its Python repr to the client.
+    pos = {"s6": {"competitive_position": {
+        "intro": "Position summary.",
+        "primary_risk": {"risk": "Unproven scale deployment", "mitigant": "Focus on regulated segments"},
+    }}, "s4": {}}
+    html2 = step7.build_landscape_tab(pos)
+    if "{'risk'" in html2 or "&#x27;risk&#x27;" in html2:
+        out.append("build_landscape_tab still renders the primary_risk dict as a Python repr")
+    if "Unproven scale deployment" not in html2:
+        out.append("build_landscape_tab lost the risk text")
+    if "Focus on regulated segments" not in html2:
+        out.append("build_landscape_tab dropped the mitigant carried inside the dict")
+    # Anti-vacuity: a plain STRING primary_risk must still render.
+    pos["s6"]["competitive_position"]["primary_risk"] = "A plain sentence risk."
+    if "A plain sentence risk." not in step7.build_landscape_tab(pos):
+        out.append("build_landscape_tab broke the normal STRING primary_risk case")
+
+    # 3. **markdown** left literal in a heading on 5 slugs: esc() where every sibling slot uses
+    #    _parse_detail_bold, which escapes AND converts.
+    pos2 = {"s6": {"competitive_position": {
+        "intro": "x",
+        "defensibility_factors": [{"factor": "**Technological moat**: 2.3M laser points", "evidence": "e"}],
+    }}, "s4": {}}
+    html3 = step7.build_landscape_tab(pos2)
+    if "**Technological moat**" in html3:
+        out.append("build_landscape_tab still ships literal **markdown** in comp-factor-title")
+    if "<strong>Technological moat</strong>" not in html3:
+        out.append("build_landscape_tab did not convert the bold in comp-factor-title")
+    return out
+
+
 def main():
-    failures = check_trl_none()
+    failures = check_trl_none() + check_shape_bugs()
     for raw, expected in CASES:
         got = esc(raw)
         if got != expected:

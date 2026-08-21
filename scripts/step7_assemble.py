@@ -1267,7 +1267,16 @@ def build_indigenous_tab(data):
             intro_text = intro_path.get("detail", "")
         else:
             intro_text = str(intro_path)
-        grant_pathways = o.get("grant_pathways", [])
+        # A STRING IS ITERABLE, AND ITERATING IT YIELDS CHARACTERS. step4-market.json carries
+        # grant_pathways as a single semicolon-joined string on 16 slugs, so `for gp in
+        # grant_pathways` below walked it one letter at a time and emitted "P<br>r<br>a<br>i..." --
+        # a ~500-character vertical column of single letters under the GRANT PATHWAYS label, on 16
+        # live client pages, with no br{display:none} to hide it. CLI-4002 item (5), "one-char-per-
+        # line text". Wrapped rather than split on ";": the string is what was authored, and
+        # splitting it would be a guess about where one pathway ends and the next begins.
+        grant_pathways = o.get("grant_pathways") or []
+        if isinstance(grant_pathways, str):
+            grant_pathways = [grant_pathways]
         action_level = o.get("action_level", "know")
 
         # SVG ring calculation: circumference = 2*pi*20 = 125.6
@@ -1596,7 +1605,11 @@ def build_landscape_tab(data):
                     f'<div class="comp-factor">'
                     f'<div class="comp-factor-hdr">'
                     f'<div class="comp-factor-num">{fi + 1}</div>'
-                    f'<div class="comp-factor-title">{esc(factor_name)}</div>'
+                    # _parse_detail_bold, not esc: it escapes too, and it converts the **bold** the
+                    # model writes. esc() alone shipped a literal "1. **Technological moat via
+                    # physics breakthrough**:" into the heading on 5 client pages (CLI-4002 item 5).
+                    # Every sibling detail slot in this file already goes through _parse_detail_bold.
+                    f'<div class="comp-factor-title">{_parse_detail_bold(factor_name)}</div>'
                     f'</div>'
                     f'<div class="comp-factor-text">{esc(evidence)}</div>'
                     f'</div>'
@@ -1605,11 +1618,25 @@ def build_landscape_tab(data):
 
         risk = comp_pos.get("primary_risk", "")
         mitigant = comp_pos.get("risk_mitigant", "")
+        # primary_risk IS A DICT on 14 of the 42 slugs that carry this slot, and esc() renders a
+        # dict as its Python repr, so the client read a literal
+        # {'risk': 'Unproven scale deployment...', 'mitigant': "Focus initial deployments..."}
+        # in their competitive-risk card. CLI-4002 item (5), "raw Python dicts". Measured: 14 of 42
+        # render the repr, 28 render prose, one producer, a 33% failure rate.
+        #
+        # Every one of those dicts carries `risk` and `mitigant`, which are exactly the two fields
+        # this block already renders, so they are lifted into the existing variables rather than
+        # given a second layout. The evidence/detail field two of them also carry rides along with
+        # the risk sentence, so no authored word is dropped.
+        if isinstance(risk, dict):
+            extra = risk.get("evidence") or risk.get("detail") or ""
+            mitigant = mitigant or risk.get("mitigant", "")
+            risk = " ".join(str(x).strip() for x in [risk.get("risk", ""), extra] if x)
         if risk:
             parts.append(
                 f'<div class="comp-risk">'
                 f'<div class="comp-risk-label">PRIMARY RISK</div>'
-                f'<div class="comp-risk-text">{esc(risk)}'
+                f'<div class="comp-risk-text">{_parse_detail_bold(risk)}'
                 f'{". Mitigant: " + esc(mitigant) if mitigant else ""}'
                 f'</div></div>'
             )
