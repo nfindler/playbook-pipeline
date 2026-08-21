@@ -40,6 +40,10 @@ CASES = [
      "project completion in April 2025, 5 MWh, 24-hour steam delivery"),
     ("from 486 to 800 ports by spring 2026 — 65% capacity increase",
      "from 486 to 800 ports by spring 2026, 65% capacity increase"),
+    ("reached 247 GWh in 2025 — 23% higher than 2024",
+     "reached 247 GWh in 2025, 23% higher than 2024"),
+    ("Royal Assent March 26, 2026 — 15% refundable tax credit",
+     "Royal Assent March 26, 2026, 15% refundable tax credit"),
     ("($100k–$1M)", "($100k to $1M)"),                                    # x44
     ("60–80% conversion", "60 to 80% conversion"),                        # x23
     ("2025–2028 window", "2025 to 2028 window"),                          # x14
@@ -95,6 +99,11 @@ def check_trl_none():
     return out
 
 
+def _excerpt(html, needle, span=70):
+    i = html.find(needle)
+    return repr(html[i:i + span]) if i >= 0 else "<needle absent>"
+
+
 def check_shape_bugs():
     """CLI-4002 item (5): three producer slots rendered a Python VALUE instead of its content.
 
@@ -147,6 +156,36 @@ def check_shape_bugs():
         out.append("build_landscape_tab joins risk and evidence into a run-on with no sentence break")
     if ".. Mitigant" in html_ev or ".. Mitigant" in html2:
         out.append("build_landscape_tab doubles the full stop before Mitigant")
+
+    # BOTH BRANCHES of the sentence-boundary conditional, because every fixture above happens to use a
+    # risk with no trailing period, so two mutants survived: _mitigant_clause never adding the stop
+    # (which ships "Capital Asymmetry Mitigant: ..." on 5 real pages) and _join_sentences always
+    # adding one (which ships ".. Mitigant" on 2).
+    pos_nostop = {"s6": {"competitive_position": {"intro": "x", "primary_risk": {
+        "risk": "Capital asymmetry", "mitigant": "Partner early"}}}, "s4": {}}
+    h_nostop = step7.build_landscape_tab(pos_nostop)
+    if "Capital asymmetry. Mitigant: Partner early" not in h_nostop:
+        out.append("a risk with NO trailing stop must gain one before Mitigant: " + _excerpt(h_nostop, "Capital asymmetry"))
+    # ...and the no-stop branch is only REACHABLE via a plain-string primary_risk, because the dict
+    # path runs _join_sentences first, which already supplies the period. Pinning it on the dict
+    # fixture alone let "never add the stop" survive: same output either way.
+    pos_str = {"s6": {"competitive_position": {
+        "intro": "x", "primary_risk": "Scale disadvantage", "risk_mitigant": "Partner early"}}, "s4": {}}
+    h_str = step7.build_landscape_tab(pos_str)
+    if "Scale disadvantage. Mitigant: Partner early" not in h_str:
+        out.append("a plain-string risk with no trailing stop must gain one before Mitigant: " + _excerpt(h_str, "Scale disadvantage"))
+    pos_str2 = {"s6": {"competitive_position": {
+        "intro": "x", "primary_risk": "Scale disadvantage.", "risk_mitigant": "Partner early"}}, "s4": {}}
+    if ".. Mitigant" in step7.build_landscape_tab(pos_str2):
+        out.append("a plain-string risk that already ends in a stop gets a doubled full stop")
+
+    pos_stop = {"s6": {"competitive_position": {"intro": "x", "primary_risk": {
+        "risk": "Capital asymmetry.", "mitigant": "Partner early"}}}, "s4": {}}
+    h_stop = step7.build_landscape_tab(pos_stop)
+    if ".. Mitigant" in h_stop:
+        out.append("a risk that ALREADY ends in a stop must not get a second one before Mitigant")
+    if "Capital asymmetry. Mitigant: Partner early" not in h_stop:
+        out.append("a risk that already ends in a stop lost its Mitigant clause: " + _excerpt(h_stop, "Capital asymmetry"))
 
     # Anti-vacuity: a plain STRING primary_risk must still render.
     pos["s6"]["competitive_position"]["primary_risk"] = "A plain sentence risk."

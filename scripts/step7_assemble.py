@@ -64,15 +64,14 @@ CD_TEAM = {
 # every clause happens to start with a number.
 #
 # The obvious repair, "only treat a TIGHT dash as a range", is wrong here and the data says so: of the
-# 57 spaced digit-dash-digit occurrences in data/, 55 are real grant-value ranges
-# ("$390,000 - $10,000,000 per award", "$1,500 - $500,000 (grants)") and exactly 2 are the welds
-# above. Requiring tight would turn every grant range back into a list, which is the defect this
+# 57 spaced digit-dash-digit occurrences in data/, 53 are real grant-value ranges
+# ("$390,000 - $10,000,000 per award", "$1,500 - $500,000 (grants)") and 4 are the welds above. Requiring tight would turn every grant range back into a list, which is the defect this
 # whole change exists to remove.
 #
 # What separates them is the MARKER, not the spacing. A spaced range in this corpus carries a
 # currency sigil or a unit on BOTH sides; a prose weld does not ("April 2025", "spring 2026" are bare
 # years). So: a tight dash between two numbers is a range, and a spaced dash is a range only when
-# both sides are marked. Verified against all 57 spaced and all 1,804 tight occurrences.
+# both sides are marked. Verified against all 57 spaced occurrences and all 2,039 tight firings.
 _DASH_CHARS = r"(?:[\u2013\u2014]|&(?:amp;)?[mn]dash;)"
 _RANGE_SIDE = r"(?:[$\u20ac\u00a3]|C\$|US\$|USD\s*)?Q?\d[\d,.]*(?:[kKmMbB]|%)?"
 _MARKED_SIDE = r"(?:(?:[$\u20ac\u00a3]|C\$|US\$|USD\s*)\d[\d,.]*(?:[kKmMbB]|%)?|\d[\d,.]*(?:[kKmMbB]|%))"
@@ -1664,11 +1663,11 @@ def build_landscape_tab(data):
 
         risk = comp_pos.get("primary_risk", "")
         mitigant = comp_pos.get("risk_mitigant", "")
-        # primary_risk IS A DICT on 14 of the 42 slugs that carry this slot, and esc() renders a
+        # primary_risk IS A DICT on 14 of the 31 slugs that carry this slot, and esc() renders a
         # dict as its Python repr, so the client read a literal
         # {'risk': 'Unproven scale deployment...', 'mitigant': "Focus initial deployments..."}
         # in their competitive-risk card. CLI-4002 item (5), "raw Python dicts". Measured: 14 of 42
-        # render the repr, 28 render prose, one producer, a 33% failure rate.
+        # render the repr, 17 render prose, one producer, a 45% failure rate.
         #
         # Every one of those dicts carries `risk` and `mitigant`, which are exactly the two fields
         # this block already renders, so they are lifted into the existing variables rather than
@@ -1757,7 +1756,7 @@ def build_landscape_tab(data):
             # guarded by an `if` before it is interpolated; trl was not, and it is the one field written
             # into the card unescaped (line below). CLI-4002 item (5): that rendered "TRL None" into the
             # competitor spec on a live client page, 5 times on sense-and-motion, where the same slot
-            # renders a number on 143 cards across the estate. `or ""` reads the null, not just the gap.
+            # renders a number on 136 cards across the live client playbooks. `or ""` reads the null, not just the gap.
             trl = c.get("trl") or ""
             funding = c.get("funding_known", "")
             delay = f" d{(i % 6) + 1}" if i < 6 else ""
