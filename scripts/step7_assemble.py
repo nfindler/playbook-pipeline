@@ -31,13 +31,65 @@ CD_TEAM = {
 }
 
 
+# CLI-4002 item (5), "en-dash corruption". The brand rule is "never an em dash" and that is NOT what
+# was wrong. What was wrong is the punctuation the substitution left behind, on 33 client slugs and
+# 8,146 dashes, live since April:
+#
+#   "USA only - Polysource is..."  ->  "USA only , Polysource is..."   space stranded before the comma
+#   "grid-scale" (em dash)         ->  "grid,scale"                    no space after
+#   "$1M-$5M"    (en dash)         ->  "$1M,$5M"                       a RANGE now reads as a list
+#
+# The third one is why this is not cosmetic. 1,049 of the 8,146 dashes sit between two digits, so a
+# cheque size or a date range became two separate figures. "$1M,$5M" renders 132 times on the live
+# estate, alongside "$50M,$500M", "2025,2028" and "TRL range (1,9)". A client cannot tell that from a
+# typo, and it is their money and their timeline. A range therefore keeps its meaning in words rather
+# than collapsing to a comma.
+#
+# The two entity forms below were measured UNREACHABLE in the old code and are kept only because input
+# could arrive pre-escaped: html.escape() turns a literal "&mdash;" into "&amp;mdash;" before the
+# replace ever ran, so `.replace("&mdash;", ",")` could never fire. Zero occurrences in the source data
+# and zero on the rendered estate either way.
+#
+# A "range side" is derived from what the source data actually contains, not from what a range looks
+# like in the abstract. Counted over all 33 slugs, the tight (unspaced) dashes are almost entirely
+# ranges: "$1M-$5M" x109, "($100k-$1M)" x44, "3-5" x28, "12-18" x23, "60-80%" x23, "2025-2026" x14,
+# "Q2-Q3" x12. So a side is an optional currency mark, digits, and an optional unit or percent.
+# A digit is required on BOTH sides, which is what keeps prose off this branch: "database - a" and
+# "'Warm' - a" have no digit on the right and fall through to the comma rule below, correctly.
+#
+# TIGHT AND SPACED ARE DIFFERENT PROBLEMS, and treating them alike welded two real sentences into a
+# fake range. A review caught it on live data: "project completion in April 2025 - 5 MWh, 24-hour
+# steam delivery" became "in April 2025 to 5 MWh", and "by spring 2026 - 65% capacity increase"
+# became "by spring 2026 to 65% capacity increase". Both are appositive dashes in a corpus where
+# every clause happens to start with a number.
+#
+# The obvious repair, "only treat a TIGHT dash as a range", is wrong here and the data says so: of the
+# 57 spaced digit-dash-digit occurrences in data/, 53 are real grant-value ranges
+# ("$390,000 - $10,000,000 per award", "$1,500 - $500,000 (grants)") and 4 are the welds above. Requiring tight would turn every grant range back into a list, which is the defect this
+# whole change exists to remove.
+#
+# What separates them is the MARKER, not the spacing. A spaced range in this corpus carries a
+# currency sigil or a unit on BOTH sides; a prose weld does not ("April 2025", "spring 2026" are bare
+# years). So: a tight dash between two numbers is a range, and a spaced dash is a range only when
+# both sides are marked. Verified against all 57 spaced occurrences and all 2,039 tight firings.
+_DASH_CHARS = r"(?:[\u2013\u2014]|&(?:amp;)?[mn]dash;)"
+_RANGE_SIDE = r"(?:[$\u20ac\u00a3]|C\$|US\$|USD\s*)?Q?\d[\d,.]*(?:[kKmMbB]|%)?"
+_MARKED_SIDE = r"(?:(?:[$\u20ac\u00a3]|C\$|US\$|USD\s*)\d[\d,.]*(?:[kKmMbB]|%)?|\d[\d,.]*(?:[kKmMbB]|%))"
+_TIGHT_RANGE_DASH = re.compile(rf"({_RANGE_SIDE}){_DASH_CHARS}({_RANGE_SIDE})")
+_SPACED_RANGE_DASH = re.compile(rf"({_MARKED_SIDE})\s+{_DASH_CHARS}\s+({_MARKED_SIDE})")
+_PROSE_DASH = re.compile(rf"\s*{_DASH_CHARS}\s*")
+
+
 def esc(s):
-    """HTML-escape a string, handle None. Replace em dashes with commas."""
+    """HTML-escape a string, handle None. Replace dashes without corrupting punctuation or ranges."""
     if s is None:
         return ""
     out = html_mod.escape(str(s))
-    # Never use em dashes
-    out = out.replace("\u2014", ",").replace("\u2013", ",").replace("&mdash;", ",").replace("&ndash;", ",")
+    # Never an em dash, either way. A numeric range keeps its meaning; every other dash becomes a
+    # comma with exactly one following space, whatever whitespace surrounded the dash.
+    out = _TIGHT_RANGE_DASH.sub(r"\1 to \2", out)
+    out = _SPACED_RANGE_DASH.sub(r"\1 to \2", out)
+    out = _PROSE_DASH.sub(", ", out)
     return out
 
 
@@ -176,6 +228,30 @@ def _pillar_pill(name):
     if "market" in n or "signal" in n:
         return "SIGNALS"
     return name.upper()
+
+
+def _join_sentences(parts):
+    """Join non-empty strings as sentences, adding a full stop only where one is missing."""
+    out = []
+    for part in parts:
+        s = str(part).strip()
+        if not s:
+            continue
+        out.append(s if s[-1] in ".!?" else s + ".")
+    return " ".join(out)
+
+
+def _mitigant_clause(risk_text, mitigant):
+    """The ". Mitigant: ..." tail, without doubling a full stop the risk sentence already carries.
+
+    Pre-existing: the literal '". Mitigant: "' produced ".. Mitigant" on 4 pages whose risk text
+    already ended in a period, and lifting the dict's mitigant into this same slot would have added
+    2 more (sono-charge-energy, voltpost).
+    """
+    if not mitigant:
+        return ""
+    sep = " Mitigant: " if str(risk_text).strip()[-1:] in ".!?" else ". Mitigant: "
+    return sep + esc(mitigant)
 
 
 def _parse_detail_bold(text):
@@ -1234,7 +1310,18 @@ def build_indigenous_tab(data):
             intro_text = intro_path.get("detail", "")
         else:
             intro_text = str(intro_path)
-        grant_pathways = o.get("grant_pathways", [])
+        # A STRING IS ITERABLE, AND ITERATING IT YIELDS CHARACTERS. step4-market.json carries
+        # grant_pathways as a single semicolon-joined string on 16 slugs, so `for gp in
+        # grant_pathways` below walked it one letter at a time and emitted "P<br>r<br>a<br>i..." --
+        # a ~500-character vertical column of single letters under the GRANT PATHWAYS label, on 16
+        # live client pages, with no br{display:none} to hide it. CLI-4002 item (5), "one-char-per-
+        # line text". Wrapped rather than split on ";": the string is what was authored, and
+        # splitting it would be a guess about where one pathway ends and the next begins.
+        # The `or []` here is likewise redundant (0 nulls and 0 absent keys across 79 occurrences);
+        # the isinstance wrap below is what does the work.
+        grant_pathways = o.get("grant_pathways") or []
+        if isinstance(grant_pathways, str):
+            grant_pathways = [grant_pathways]
         action_level = o.get("action_level", "know")
 
         # SVG ring calculation: circumference = 2*pi*20 = 125.6
@@ -1563,7 +1650,11 @@ def build_landscape_tab(data):
                     f'<div class="comp-factor">'
                     f'<div class="comp-factor-hdr">'
                     f'<div class="comp-factor-num">{fi + 1}</div>'
-                    f'<div class="comp-factor-title">{esc(factor_name)}</div>'
+                    # _parse_detail_bold, not esc: it escapes too, and it converts the **bold** the
+                    # model writes. esc() alone shipped a literal "1. **Technological moat via
+                    # physics breakthrough**:" into the heading on 5 client pages (CLI-4002 item 5).
+                    # Every sibling detail slot in this file already goes through _parse_detail_bold.
+                    f'<div class="comp-factor-title">{_parse_detail_bold(factor_name)}</div>'
                     f'</div>'
                     f'<div class="comp-factor-text">{esc(evidence)}</div>'
                     f'</div>'
@@ -1572,12 +1663,29 @@ def build_landscape_tab(data):
 
         risk = comp_pos.get("primary_risk", "")
         mitigant = comp_pos.get("risk_mitigant", "")
+        # primary_risk IS A DICT on 14 of the 31 slugs that carry this slot, and esc() renders a
+        # dict as its Python repr, so the client read a literal
+        # {'risk': 'Unproven scale deployment...', 'mitigant': "Focus initial deployments..."}
+        # in their competitive-risk card. CLI-4002 item (5), "raw Python dicts". Measured: 14 of 42
+        # render the repr, 17 render prose, one producer, a 45% failure rate.
+        #
+        # Every one of those dicts carries `risk` and `mitigant`, which are exactly the two fields
+        # this block already renders, so they are lifted into the existing variables rather than
+        # given a second layout. The evidence/detail field two of them also carry rides along with
+        # the risk sentence, so no authored word is dropped.
+        if isinstance(risk, dict):
+            extra = risk.get("evidence") or risk.get("detail") or ""
+            mitigant = mitigant or risk.get("mitigant", "")
+            # Joined as SENTENCES, not with a bare space. A plain " ".join shipped a run-on on
+            # princeton-energy ("...offtake agreements Ascend Elements can offer..."), which is a
+            # different defect from the one being fixed, not a smaller version of it.
+            risk = _join_sentences([risk.get("risk", ""), extra])
         if risk:
             parts.append(
                 f'<div class="comp-risk">'
                 f'<div class="comp-risk-label">PRIMARY RISK</div>'
-                f'<div class="comp-risk-text">{esc(risk)}'
-                f'{". Mitigant: " + esc(mitigant) if mitigant else ""}'
+                f'<div class="comp-risk-text">{_parse_detail_bold(risk)}'
+                f'{_mitigant_clause(risk, mitigant)}'
                 f'</div></div>'
             )
 
@@ -1637,7 +1745,19 @@ def build_landscape_tab(data):
             diff = c.get("differentiator_vs_frett", "")
             strengths = c.get("strengths", "")
             weaknesses = c.get("weaknesses", "")
-            trl = c.get("trl", "")
+            # REDUNDANT DEFENCE, and saying so is the honest result of mutation-testing it: the
+            # render site below already absorbs None via `if trl else "unknown"`, and the trl key is
+            # never absent (0 of 151 cards), so reverting this line alone keeps the suite green. Kept
+            # because it states the intent where the value is read, matching how this codebase treats
+            # its other equivalent mutants. The load-bearing edit is the one at the render site.
+            #
+            # `.get(k, "")` returns the DEFAULT only when the key is ABSENT. step4-market.json carries
+            # "trl": null explicitly, so this returned None, not "". Every sibling field on this card is
+            # guarded by an `if` before it is interpolated; trl was not, and it is the one field written
+            # into the card unescaped (line below). CLI-4002 item (5): that rendered "TRL None" into the
+            # competitor spec on a live client page, 5 times on sense-and-motion, where the same slot
+            # renders a number on 136 cards across the live client playbooks. `or ""` reads the null, not just the gap.
+            trl = c.get("trl") or ""
             funding = c.get("funding_known", "")
             delay = f" d{(i % 6) + 1}" if i < 6 else ""
 
@@ -1658,7 +1778,7 @@ def build_landscape_tab(data):
                 f'    <div class="sc-body">'
                 f'      <div class="sc-pill">COMPETITOR</div>'
                 f'      <div class="sc-tt">{esc(cname)}</div>'
-                f'      <div class="sc-ds">TRL {trl} | {esc(funding[:80]) if funding else "Funding unknown"}</div>'
+                f'      <div class="sc-ds">TRL {esc(trl) if trl else "unknown"} | {esc(funding[:80]) if funding else "Funding unknown"}</div>'
                 f'    </div>'
                 f'    <div class="sc-tog">{CHEVRON_SVG}</div>'
                 f'  </div>'
