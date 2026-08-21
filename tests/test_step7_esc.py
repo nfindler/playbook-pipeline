@@ -30,7 +30,16 @@ esc = step7.esc
 CASES = [
     # Ranges keep their meaning. These are the 1,049 that were changing what a client reads.
     ("Cheque size $1M–$5M typical", "Cheque size $1M to $5M typical"),   # x109 tight
-    ("Cheque size $1M – $5M typical", "Cheque size $1M to $5M typical"),  # spaced form
+    ("Cheque size $1M – $5M typical", "Cheque size $1M to $5M typical"),  # spaced, BOTH sides marked
+    # 55 of the 57 spaced digit-dash-digit occurrences in data/ are grant ranges like these.
+    ("$390,000 – $10,000,000 per award", "$390,000 to $10,000,000 per award"),
+    ("$1,500 – $500,000 (grants)", "$1,500 to $500,000 (grants)"),
+    # ...and the 2 that are NOT ranges: an appositive dash whose left side is a bare date. Treating
+    # these as ranges welded two real sentences together on live client pages.
+    ("project completion in April 2025 — 5 MWh, 24-hour steam delivery",
+     "project completion in April 2025, 5 MWh, 24-hour steam delivery"),
+    ("from 486 to 800 ports by spring 2026 — 65% capacity increase",
+     "from 486 to 800 ports by spring 2026, 65% capacity increase"),
     ("($100k–$1M)", "($100k to $1M)"),                                    # x44
     ("60–80% conversion", "60 to 80% conversion"),                        # x23
     ("2025–2028 window", "2025 to 2028 window"),                          # x14
@@ -124,6 +133,21 @@ def check_shape_bugs():
         out.append("build_landscape_tab lost the risk text")
     if "Focus on regulated segments" not in html2:
         out.append("build_landscape_tab dropped the mitigant carried inside the dict")
+    # The evidence/detail field two of the 14 dicts carry must survive, and the parts must be joined
+    # as SENTENCES. Nothing pinned either, and a bare-space join shipped a run-on on princeton-energy.
+    pos_ev = {"s6": {"competitive_position": {
+        "intro": "x",
+        "primary_risk": {"risk": "Capital constraints limit scale", "evidence": "Only one filing found",
+                         "mitigant": "Partner for capacity"},
+    }}, "s4": {}}
+    html_ev = step7.build_landscape_tab(pos_ev)
+    if "Only one filing found" not in html_ev:
+        out.append("build_landscape_tab dropped the evidence field carried inside the dict")
+    if "Capital constraints limit scale Only one filing" in html_ev:
+        out.append("build_landscape_tab joins risk and evidence into a run-on with no sentence break")
+    if ".. Mitigant" in html_ev or ".. Mitigant" in html2:
+        out.append("build_landscape_tab doubles the full stop before Mitigant")
+
     # Anti-vacuity: a plain STRING primary_risk must still render.
     pos["s6"]["competitive_position"]["primary_risk"] = "A plain sentence risk."
     if "A plain sentence risk." not in step7.build_landscape_tab(pos):

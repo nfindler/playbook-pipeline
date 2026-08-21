@@ -56,9 +56,28 @@ CD_TEAM = {
 # "Q2-Q3" x12. So a side is an optional currency mark, digits, and an optional unit or percent.
 # A digit is required on BOTH sides, which is what keeps prose off this branch: "database - a" and
 # "'Warm' - a" have no digit on the right and fall through to the comma rule below, correctly.
+#
+# TIGHT AND SPACED ARE DIFFERENT PROBLEMS, and treating them alike welded two real sentences into a
+# fake range. A review caught it on live data: "project completion in April 2025 - 5 MWh, 24-hour
+# steam delivery" became "in April 2025 to 5 MWh", and "by spring 2026 - 65% capacity increase"
+# became "by spring 2026 to 65% capacity increase". Both are appositive dashes in a corpus where
+# every clause happens to start with a number.
+#
+# The obvious repair, "only treat a TIGHT dash as a range", is wrong here and the data says so: of the
+# 57 spaced digit-dash-digit occurrences in data/, 55 are real grant-value ranges
+# ("$390,000 - $10,000,000 per award", "$1,500 - $500,000 (grants)") and exactly 2 are the welds
+# above. Requiring tight would turn every grant range back into a list, which is the defect this
+# whole change exists to remove.
+#
+# What separates them is the MARKER, not the spacing. A spaced range in this corpus carries a
+# currency sigil or a unit on BOTH sides; a prose weld does not ("April 2025", "spring 2026" are bare
+# years). So: a tight dash between two numbers is a range, and a spaced dash is a range only when
+# both sides are marked. Verified against all 57 spaced and all 1,804 tight occurrences.
 _DASH_CHARS = r"(?:[\u2013\u2014]|&(?:amp;)?[mn]dash;)"
 _RANGE_SIDE = r"(?:[$\u20ac\u00a3]|C\$|US\$|USD\s*)?Q?\d[\d,.]*(?:[kKmMbB]|%)?"
-_NUM_RANGE_DASH = re.compile(rf"({_RANGE_SIDE})\s*{_DASH_CHARS}\s*({_RANGE_SIDE})")
+_MARKED_SIDE = r"(?:(?:[$\u20ac\u00a3]|C\$|US\$|USD\s*)\d[\d,.]*(?:[kKmMbB]|%)?|\d[\d,.]*(?:[kKmMbB]|%))"
+_TIGHT_RANGE_DASH = re.compile(rf"({_RANGE_SIDE}){_DASH_CHARS}({_RANGE_SIDE})")
+_SPACED_RANGE_DASH = re.compile(rf"({_MARKED_SIDE})\s+{_DASH_CHARS}\s+({_MARKED_SIDE})")
 _PROSE_DASH = re.compile(rf"\s*{_DASH_CHARS}\s*")
 
 
@@ -69,7 +88,8 @@ def esc(s):
     out = html_mod.escape(str(s))
     # Never an em dash, either way. A numeric range keeps its meaning; every other dash becomes a
     # comma with exactly one following space, whatever whitespace surrounded the dash.
-    out = _NUM_RANGE_DASH.sub(r"\1 to \2", out)
+    out = _TIGHT_RANGE_DASH.sub(r"\1 to \2", out)
+    out = _SPACED_RANGE_DASH.sub(r"\1 to \2", out)
     out = _PROSE_DASH.sub(", ", out)
     return out
 
@@ -209,6 +229,30 @@ def _pillar_pill(name):
     if "market" in n or "signal" in n:
         return "SIGNALS"
     return name.upper()
+
+
+def _join_sentences(parts):
+    """Join non-empty strings as sentences, adding a full stop only where one is missing."""
+    out = []
+    for part in parts:
+        s = str(part).strip()
+        if not s:
+            continue
+        out.append(s if s[-1] in ".!?" else s + ".")
+    return " ".join(out)
+
+
+def _mitigant_clause(risk_text, mitigant):
+    """The ". Mitigant: ..." tail, without doubling a full stop the risk sentence already carries.
+
+    Pre-existing: the literal '". Mitigant: "' produced ".. Mitigant" on 4 pages whose risk text
+    already ended in a period, and lifting the dict's mitigant into this same slot would have added
+    2 more (sono-charge-energy, voltpost).
+    """
+    if not mitigant:
+        return ""
+    sep = " Mitigant: " if str(risk_text).strip()[-1:] in ".!?" else ". Mitigant: "
+    return sep + esc(mitigant)
 
 
 def _parse_detail_bold(text):
@@ -1274,6 +1318,8 @@ def build_indigenous_tab(data):
         # live client pages, with no br{display:none} to hide it. CLI-4002 item (5), "one-char-per-
         # line text". Wrapped rather than split on ";": the string is what was authored, and
         # splitting it would be a guess about where one pathway ends and the next begins.
+        # The `or []` here is likewise redundant (0 nulls and 0 absent keys across 79 occurrences);
+        # the isinstance wrap below is what does the work.
         grant_pathways = o.get("grant_pathways") or []
         if isinstance(grant_pathways, str):
             grant_pathways = [grant_pathways]
@@ -1631,13 +1677,16 @@ def build_landscape_tab(data):
         if isinstance(risk, dict):
             extra = risk.get("evidence") or risk.get("detail") or ""
             mitigant = mitigant or risk.get("mitigant", "")
-            risk = " ".join(str(x).strip() for x in [risk.get("risk", ""), extra] if x)
+            # Joined as SENTENCES, not with a bare space. A plain " ".join shipped a run-on on
+            # princeton-energy ("...offtake agreements Ascend Elements can offer..."), which is a
+            # different defect from the one being fixed, not a smaller version of it.
+            risk = _join_sentences([risk.get("risk", ""), extra])
         if risk:
             parts.append(
                 f'<div class="comp-risk">'
                 f'<div class="comp-risk-label">PRIMARY RISK</div>'
                 f'<div class="comp-risk-text">{_parse_detail_bold(risk)}'
-                f'{". Mitigant: " + esc(mitigant) if mitigant else ""}'
+                f'{_mitigant_clause(risk, mitigant)}'
                 f'</div></div>'
             )
 
@@ -1697,6 +1746,12 @@ def build_landscape_tab(data):
             diff = c.get("differentiator_vs_frett", "")
             strengths = c.get("strengths", "")
             weaknesses = c.get("weaknesses", "")
+            # REDUNDANT DEFENCE, and saying so is the honest result of mutation-testing it: the
+            # render site below already absorbs None via `if trl else "unknown"`, and the trl key is
+            # never absent (0 of 151 cards), so reverting this line alone keeps the suite green. Kept
+            # because it states the intent where the value is read, matching how this codebase treats
+            # its other equivalent mutants. The load-bearing edit is the one at the render site.
+            #
             # `.get(k, "")` returns the DEFAULT only when the key is ABSENT. step4-market.json carries
             # "trl": null explicitly, so this returned None, not "". Every sibling field on this card is
             # guarded by an `if` before it is interpolated; trl was not, and it is the one field written
